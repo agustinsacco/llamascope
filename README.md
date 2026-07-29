@@ -92,3 +92,9 @@ export LLAMA_API_URL="http://127.0.0.1:8086"
 | `q` | Safe Exit / Quit |
 | `c` | Clear Diagnostics Log Panel |
 | `Tab` | Cycle Selected Slot performance graph |
+
+---
+
+## 📄 License
+
+Licensed under the [MIT License](LICENSE).
