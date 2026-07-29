@@ -12,3 +12,5 @@ dist/
 build/
 *.egg
 .DS_Store
+/target/
+
