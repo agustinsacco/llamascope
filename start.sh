@@ -1,23 +1,12 @@
-#!/bin/bash
-# LlamaScope Launcher
-# High-performance Ratatui TUI dashboard for llama-server.
-
+#!/usr/bin/env bash
+# Cargo's incremental build prevents stale binaries; every argument reaches the app.
+set -euo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "📡 Initializing LlamaScope TUI..."
-
-# Compile if binary does not exist
-if [ ! -f "$APP_DIR/target/release/llamascope" ]; then
-    echo "📦 Building release binary..."
-    cd "$APP_DIR"
-    cargo build --release
-    if [ $? -ne 0 ]; then
-        echo "❌ Error: Compilation failed."
-        exit 1
-    fi
+if ! command -v cargo >/dev/null 2>&1; then
+    printf 'Rust/Cargo is required. Install it from https://rustup.rs, then retry.\n' >&2
+    exit 1
 fi
 
-# Launch TUI
-"$APP_DIR/target/release/llamascope"
-
+exec cargo run --locked --release --manifest-path "$APP_DIR/Cargo.toml" -- "$@"

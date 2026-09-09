@@ -1,0 +1,7 @@
+{
+  "total_slots": 2,
+  "model_path": "/models/test-model-q8_0.gguf",
+  "build_info": "b12345-test",
+  "is_sleeping": false,
+  "default_generation_settings": { "n_ctx": 8192 }
+}
