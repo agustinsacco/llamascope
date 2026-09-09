@@ -1,0 +1,47 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Rust + terminal / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Strict lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests and rendered states
+        run: cargo test --locked --all-targets
+      - name: Build and documentation
+        run: |
+          cargo build --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+      - name: Real terminal interactions and restoration
+        run: python3 tests/terminal_smoke.py
+      - name: Launcher and installer contracts
+        run: |
+          bash -n start.sh install.sh
+          python3 tests/scripts_smoke.py

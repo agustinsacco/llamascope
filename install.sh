@@ -1,52 +1,19 @@
-#!/bin/bash
-# LlamaScope Installer Script
-
-set -e
-
-echo "📡 Starting LlamaScope Installation..."
-
-# 1. Ensure Rust & Cargo are installed
-if ! command -v cargo &> /dev/null; then
-    echo "📦 Rust/Cargo not found. Installing via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    export PATH="$HOME/.cargo/bin:$PATH"
-else
-    echo "✅ Rust/Cargo is already installed."
-fi
-
-# 2. Compile in Release Mode
-echo "🔨 Compiling LlamaScope..."
+#!/usr/bin/env bash
+# Explicit, user-local installation. Never downloads a toolchain or edits shell files.
+set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$APP_DIR"
-cargo build --release
+PREFIX="${PREFIX:-$HOME/.local}"
 
-# 3. Create install destination
-INSTALL_DIR="$HOME/.local/bin"
-mkdir -p "$INSTALL_DIR"
-
-# 4. Copy binary
-echo "🚀 Installing binary to $INSTALL_DIR/llamascope..."
-cp target/release/llamascope "$INSTALL_DIR/llamascope"
-
-# 5. Shell PATH setup helper
-SHELL_RC=""
-if [ -n "$SHELL" ]; then
-    SHELL_NAME=$(basename "$SHELL")
-    if [ "$SHELL_NAME" = "bash" ]; then
-        SHELL_RC="$HOME/.bashrc"
-    elif [ "$SHELL_NAME" = "zsh" ]; then
-        SHELL_RC="$HOME/.zshrc"
-    fi
+if ! command -v cargo >/dev/null 2>&1; then
+    printf 'Rust/Cargo is required. Install it from https://rustup.rs, then retry.\n' >&2
+    exit 1
 fi
 
-if [ -n "$SHELL_RC" ] && [ -f "$SHELL_RC" ]; then
-    if ! grep -q '\.local/bin' "$SHELL_RC"; then
-        echo "Updating $SHELL_RC to add \$HOME/.local/bin to PATH..."
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
-        echo "✅ PATH updated. Please reload your shell or run: source $SHELL_RC"
-    else
-        echo "✅ \$HOME/.local/bin is already in your PATH inside $SHELL_RC"
-    fi
-fi
-
-echo "🎉 LlamaScope successfully installed! Run it using: llamascope"
+printf 'Installing LlamaScope to %s/bin (replaces an existing LlamaScope binary)...\n' "$PREFIX"
+cargo install --locked --path "$APP_DIR" --root "$PREFIX" --bin llamascope --force
+printf '\nInstalled. Try: %s/bin/llamascope --demo\n' "$PREFIX"
+case ":$PATH:" in
+    *":$PREFIX/bin:"*) ;;
+    *) printf 'Add this directory to your PATH if desired: %s/bin\nNo shell configuration was changed.\n' "$PREFIX" ;;
+esac

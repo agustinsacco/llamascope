@@ -1,308 +1,432 @@
-use std::collections::HashMap;
-use std::time::{Instant, Duration};
-use serde::{Deserialize, Serialize};
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub enum LogLevel {
-    Info,
-    Warn,
+//! Read-only llama-server protocol adapter and bounded polling worker.
+use crate::config::Config;
+use reqwest::{blocking::Client, StatusCode};
+use serde::Deserialize;
+use serde_json::Value;
+use std::{
+    collections::HashMap,
+    io::Read,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnectionState {
+    #[default]
+    Connecting,
+    Loading,
+    Live,
+    Degraded,
+    Offline,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct GpuTelemetry {
-    pub usage: f64,
-    pub temp: f64,
-    pub power: f64,
-    pub mem_total: f64,
-    pub mem_used: f64,
-    pub vram_total: f64,
-    pub vram_used: f64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LlamaSlot {
     pub id: u32,
     pub busy: bool,
-    pub task_id: String,
-    pub n_ctx: u32,
-    pub n_prompt_tokens: u32,
-    pub n_prompt_tokens_processed: u32,
-    pub n_prompt_tokens_cache: u32,
-    pub n_decoded: u32,
-    pub n_remain: u32,
-    pub tps: f64,
+    pub task_id: Option<String>,
+    pub n_ctx: Option<u64>,
+    pub n_prompt_tokens: Option<u64>,
+    pub n_prompt_tokens_processed: Option<u64>,
+    pub n_decoded: Option<u64>,
+    pub n_remain: Option<i64>,
+    pub tps: Option<f64>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+impl LlamaSlot {
+    pub fn phase(&self) -> &'static str {
+        if !self.busy {
+            "Idle"
+        } else if matches!((self.n_prompt_tokens_processed, self.n_prompt_tokens), (Some(a), Some(b)) if a < b)
+        {
+            "Prefill"
+        } else if self.n_decoded.is_some_and(|n| n > 0) {
+            "Decoding"
+        } else {
+            "Working"
+        }
+    }
+    /// A token-count estimate, not measured physical KV memory allocation.
+    pub fn kv_percent(&self) -> Option<f64> {
+        let ctx = self.n_ctx.filter(|n| *n > 0)?;
+        let used = self
+            .n_prompt_tokens_processed?
+            .saturating_add(self.n_decoded?);
+        Some((used as f64 / ctx as f64 * 100.0).clamp(0.0, 100.0))
+    }
+    pub fn prompt_percent(&self) -> Option<f64> {
+        let total = self.n_prompt_tokens.filter(|n| *n > 0)?;
+        Some((self.n_prompt_tokens_processed? as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct LlamaProps {
+    #[serde(default, rename = "model_path")]
     pub model_name: String,
     pub total_slots: u32,
-    pub queue_size: u32,
-    pub build_info: String,
+    pub queue_size: Option<u32>,
+    pub build_info: Option<String>,
+    #[serde(default)]
+    pub is_sleeping: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct TelemetryData {
-    pub gpu: Option<GpuTelemetry>,
+    pub connection: ConnectionState,
+    pub detail: String,
     pub llama_slots: Option<Vec<LlamaSlot>>,
     pub llama_props: Option<LlamaProps>,
+    pub sampled_at: Instant,
+    pub latency: Duration,
 }
 
-#[derive(Deserialize, Debug)]
-struct RawSlotToken {
-    n_decoded: u32,
-    n_remain: u32,
+impl TelemetryData {
+    pub fn status(connection: ConnectionState, detail: impl Into<String>) -> Self {
+        Self {
+            connection,
+            detail: detail.into(),
+            llama_slots: None,
+            llama_props: None,
+            sampled_at: Instant::now(),
+            latency: Duration::ZERO,
+        }
+    }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
+struct RawToken {
+    n_decoded: Option<u64>,
+    n_remain: Option<i64>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NextToken {
+    Object(RawToken),
+    Legacy(Vec<RawToken>),
+}
+#[derive(Deserialize)]
 struct RawSlot {
     id: u32,
     is_processing: bool,
-    id_task: Option<serde_json::Value>,
-    n_ctx: u32,
-    n_prompt_tokens: Option<u32>,
-    n_prompt_tokens_processed: Option<u32>,
-    n_prompt_tokens_cache: Option<u32>,
-    next_token: Option<Vec<RawSlotToken>>,
+    id_task: Option<Value>,
+    n_ctx: Option<u64>,
+    n_prompt_tokens: Option<u64>,
+    n_prompt_tokens_processed: Option<u64>,
+    next_token: Option<NextToken>,
 }
 
-#[derive(Deserialize, Debug)]
-struct RawProps {
-    total_slots: Option<u32>,
-    model_path: Option<String>,
-    queue_size: Option<u32>,
-    build_info: Option<String>,
+struct Counter {
+    task: Option<String>,
+    decoded: u64,
+    at: Instant,
+}
+#[derive(Default)]
+pub struct SlotTracker {
+    counts: HashMap<u32, Counter>,
 }
 
-fn parse_json_f64(val: Option<&serde_json::Value>) -> f64 {
-    match val {
-        Some(serde_json::Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
-        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        _ => 0.0,
-    }
-}
-
-fn get_gpu_telemetry() -> Option<GpuTelemetry> {
-    // 1. Run rocm-smi -a --json
-    let rocm_res = std::process::Command::new("rocm-smi")
-        .args(["-a", "--json"])
-        .output()
-        .ok()?;
-
-    if !rocm_res.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&rocm_res.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-    let card0 = v.get("card0")?;
-
-    let usage = parse_json_f64(card0.get("GPU use (%)"));
-    let temp = parse_json_f64(card0.get("Temperature (Sensor edge) (C)"));
-    let power = parse_json_f64(card0.get("Current Socket Graphics Package Power (W)"));
-
-    // 2. Run free -b
-    let free_res = std::process::Command::new("free")
-        .arg("-b")
-        .output()
-        .ok()?;
-
-    let free_stdout = String::from_utf8_lossy(&free_res.stdout);
-    let lines: Vec<&str> = free_stdout.lines().collect();
-    let mut mem_total = 0.0;
-    let mut mem_used = 0.0;
-    if lines.len() > 1 {
-        let parts: Vec<&str> = lines[1].split_whitespace().collect();
-        if parts.len() > 2 {
-            let total_bytes = parts[1].parse::<u64>().unwrap_or(0);
-            let used_bytes = parts[2].parse::<u64>().unwrap_or(0);
-            mem_total = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            mem_used = used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+impl SlotTracker {
+    pub fn parse(&mut self, json: &str, now: Instant) -> Result<Vec<LlamaSlot>, String> {
+        let raw: Vec<RawSlot> = serde_json::from_str(json)
+            .map_err(|_| "Invalid JSON/schema from /slots; check your llama-server version.")?;
+        if raw.len() > 1024 {
+            return Err("/slots exceeded the 1024-slot safety limit.".into());
         }
-    }
-
-    // 3. Run rocm-smi --showmeminfo vram --json
-    let mut vram_total = 0.0;
-    let mut vram_used = 0.0;
-    if let Ok(vram_res) = std::process::Command::new("rocm-smi")
-        .args(["--showmeminfo", "vram", "--json"])
-        .output()
-    {
-        if vram_res.status.success() {
-            let vram_stdout = String::from_utf8_lossy(&vram_res.stdout);
-            if let Ok(vv) = serde_json::from_str::<serde_json::Value>(&vram_stdout) {
-                if let Some(card_vram) = vv.get("card0") {
-                    let total_bytes = parse_json_f64(card_vram.get("VRAM Total Memory (B)"));
-                    let used_bytes = parse_json_f64(card_vram.get("VRAM Total Used Memory (B)"));
-                    vram_total = total_bytes / (1024.0 * 1024.0 * 1024.0);
-                    vram_used = used_bytes / (1024.0 * 1024.0 * 1024.0);
-                }
-            }
+        let mut ids = std::collections::HashSet::new();
+        if raw.iter().any(|s| !ids.insert(s.id)) {
+            return Err("Duplicate slot IDs in /slots response.".into());
         }
-    }
-
-    Some(GpuTelemetry {
-        usage,
-        temp,
-        power,
-        mem_total,
-        mem_used,
-        vram_total,
-        vram_used,
-    })
-}
-
-fn get_llama_telemetry(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    last_counts: &mut HashMap<u32, (u32, Instant)>,
-) -> (Option<Vec<LlamaSlot>>, Option<LlamaProps>) {
-    let slots_res = client.get(format!("{}/slots", api_url)).send();
-    let props_res = client.get(format!("{}/props", api_url)).send();
-
-    let raw_slots: Vec<RawSlot> = match slots_res {
-        Ok(res) => res.json().unwrap_or_default(),
-        Err(_) => return (None, None),
-    };
-
-    let raw_props: RawProps = match props_res {
-        Ok(res) => res.json().unwrap_or_else(|_| RawProps {
-            total_slots: None,
-            model_path: None,
-            queue_size: None,
-            build_info: None,
-        }),
-        Err(_) => return (None, None),
-    };
-
-    let now = Instant::now();
-    let mut slots = Vec::new();
-
-    for s in raw_slots {
-        let n_decoded = s.next_token.as_ref()
-            .and_then(|v| v.first())
-            .map(|t| t.n_decoded)
-            .unwrap_or(0);
-        let n_remain = s.next_token.as_ref()
-            .and_then(|v| v.first())
-            .map(|t| t.n_remain)
-            .unwrap_or(0);
-
-        let tps = if let Some(&(prev_count, prev_time)) = last_counts.get(&s.id) {
-            let dt = now.duration_since(prev_time).as_secs_f64();
-            if dt > 0.0 && n_decoded > prev_count {
-                (n_decoded - prev_count) as f64 / dt
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        last_counts.insert(s.id, (n_decoded, now));
-
-        let task_id = match s.id_task {
-            Some(serde_json::Value::Number(n)) => n.to_string(),
-            Some(serde_json::Value::String(st)) => st,
-            _ => "N/A".to_string(),
-        };
-
-        slots.push(LlamaSlot {
-            id: s.id,
-            busy: s.is_processing,
-            task_id,
-            n_ctx: s.n_ctx,
-            n_prompt_tokens: s.n_prompt_tokens.unwrap_or(0),
-            n_prompt_tokens_processed: s.n_prompt_tokens_processed.unwrap_or(0),
-            n_prompt_tokens_cache: s.n_prompt_tokens_cache.unwrap_or(0),
-            n_decoded,
-            n_remain,
-            tps,
-        });
-    }
-
-    let model_path = raw_props.model_path.unwrap_or_else(|| "N/A".to_string());
-    let model_name = std::path::Path::new(&model_path)
-        .file_name()
-        .map(|os_str| os_str.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "N/A".to_string());
-
-    let props = LlamaProps {
-        model_name,
-        total_slots: raw_props.total_slots.unwrap_or(0),
-        queue_size: raw_props.queue_size.unwrap_or(0),
-        build_info: raw_props.build_info.unwrap_or_else(|| "N/A".to_string()),
-    };
-
-    (Some(slots), Some(props))
-}
-
-pub fn start_polling_thread(
-    api_url: String,
-    tx: std::sync::mpsc::Sender<TelemetryData>,
-) {
-    std::thread::spawn(move || {
-        let mut last_counts = HashMap::new();
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(15000))
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
-
-        loop {
-            let gpu = get_gpu_telemetry();
-            let (llama_slots, llama_props) = get_llama_telemetry(&client, &api_url, &mut last_counts);
-
-            let data = TelemetryData {
-                gpu,
-                llama_slots,
-                llama_props,
+        let mut slots = Vec::with_capacity(raw.len());
+        for s in raw {
+            let token = match s.next_token {
+                Some(NextToken::Object(t)) => Some(t),
+                Some(NextToken::Legacy(v)) => v.into_iter().next(),
+                None => None,
             };
-
-            if tx.send(data).is_err() {
-                break; // Receiver hung up
+            let decoded = token.as_ref().and_then(|t| t.n_decoded);
+            let task = match s.id_task {
+                Some(Value::Number(n)) => Some(n.to_string()),
+                Some(Value::String(s)) => Some(s),
+                _ => None,
+            };
+            let tps = if s.is_processing {
+                self.counts.get(&s.id).and_then(|prev| {
+                    // Missing identity cannot prove continuity across slot reuse.
+                    let elapsed = now.saturating_duration_since(prev.at).as_secs_f64();
+                    let count = decoded?;
+                    (task.is_some() && prev.task == task && count >= prev.decoded && elapsed > 0.0)
+                        .then(|| (count - prev.decoded) as f64 / elapsed)
+                })
+            } else {
+                Some(0.0)
+            };
+            if let Some(count) = decoded.filter(|_| s.is_processing) {
+                self.counts.insert(
+                    s.id,
+                    Counter {
+                        task: task.clone(),
+                        decoded: count,
+                        at: now,
+                    },
+                );
+            } else {
+                self.counts.remove(&s.id);
             }
-
-            std::thread::sleep(Duration::from_millis(500));
+            slots.push(LlamaSlot {
+                id: s.id,
+                busy: s.is_processing,
+                task_id: task,
+                n_ctx: s.n_ctx,
+                n_prompt_tokens: s.n_prompt_tokens,
+                n_prompt_tokens_processed: s.n_prompt_tokens_processed,
+                n_decoded: decoded,
+                n_remain: token.and_then(|t| t.n_remain),
+                tps,
+            });
         }
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_json_f64() {
-        // String cases
-        let val_str = serde_json::Value::String("45.2".to_string());
-        assert_eq!(parse_json_f64(Some(&val_str)), 45.2);
-
-        let val_invalid_str = serde_json::Value::String("invalid".to_string());
-        assert_eq!(parse_json_f64(Some(&val_invalid_str)), 0.0);
-
-        // Number cases
-        let val_num = serde_json::Value::Number(serde_json::Number::from_f64(120.5).unwrap());
-        assert_eq!(parse_json_f64(Some(&val_num)), 120.5);
-
-        // Null case
-        assert_eq!(parse_json_f64(None), 0.0);
-    }
-
-    #[test]
-    fn test_gpu_telemetry_default() {
-        let t = GpuTelemetry::default();
-        assert_eq!(t.usage, 0.0);
-        assert_eq!(t.temp, 0.0);
-        assert_eq!(t.mem_total, 0.0);
-    }
-
-    #[test]
-    fn test_model_name_extraction() {
-        let model_path = "/home/stark/models/test-model-q8_0.gguf";
-        let model_name = std::path::Path::new(model_path)
-            .file_name()
-            .map(|os_str| os_str.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "N/A".to_string());
-        assert_eq!(model_name, "test-model-q8_0.gguf");
+        self.counts.retain(|id, _| ids.contains(id));
+        slots.sort_by_key(|s| s.id);
+        Ok(slots)
     }
 }
 
+/// Prevent server-provided text from injecting terminal controls or unbounded labels.
+pub fn safe_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(160)
+        .collect()
+}
+
+struct EndpointError {
+    state: ConnectionState,
+    message: String,
+}
+
+pub struct Poller {
+    client: Client,
+    config: Config,
+    tracker: SlotTracker,
+    props: Option<LlamaProps>,
+    props_at: Option<Instant>,
+}
+
+impl Poller {
+    pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(key) = &config.api_key {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(1))
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(headers)
+            .user_agent(concat!("llamascope/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(Self {
+            client,
+            config,
+            tracker: SlotTracker::default(),
+            props: None,
+            props_at: None,
+        })
+    }
+
+    fn get(&self, endpoint: &str) -> Result<String, EndpointError> {
+        let response = self.client.get(format!("{}{endpoint}", self.config.api_url)).send().map_err(|e| EndpointError {
+            state: ConnectionState::Offline,
+            message: if e.is_timeout() { format!("{endpoint} timed out after 2s. Retrying automatically; r retries sooner.") }
+                else { format!("Cannot reach {endpoint}. Check the server URL, network, and TLS certificate; r retries.") },
+        })?;
+        let status = response.status();
+        // Do not retain prompts, response bodies, or credential-bearing errors in diagnostics.
+        const LIMIT: u64 = 2 * 1024 * 1024;
+        let mut body = String::new();
+        response
+            .take(LIMIT + 1)
+            .read_to_string(&mut body)
+            .map_err(|_| EndpointError {
+                state: ConnectionState::Degraded,
+                message: format!("Could not read {endpoint}; response must be UTF-8 and complete."),
+            })?;
+        if body.len() as u64 > LIMIT {
+            return Err(EndpointError {
+                state: ConnectionState::Degraded,
+                message: format!("{endpoint} exceeded the 2 MiB response limit."),
+            });
+        }
+        if status == StatusCode::SERVICE_UNAVAILABLE
+            && endpoint == "/health"
+            && serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|s| s.eq_ignore_ascii_case("loading model"))
+        {
+            return Err(EndpointError {
+                state: ConnectionState::Loading,
+                message: "Model is loading. Waiting for llama-server; no action needed.".into(),
+            });
+        }
+        if !status.is_success() {
+            let hint = match status.as_u16() {
+                401 | 403 => "Access denied. Set LLAMA_API_KEY and check server permissions.",
+                404 | 501 if endpoint == "/slots" => {
+                    "Slot monitoring unavailable. Remove --no-slots (older builds: enable --slots)."
+                }
+                404 => "Endpoint not found. Check the base URL and llama-server version.",
+                300..=399 => "Redirect refused. Use the final server URL directly.",
+                _ => "Server returned an error. Retrying automatically.",
+            };
+            return Err(EndpointError {
+                state: ConnectionState::Degraded,
+                message: format!("{endpoint}: HTTP {}. {hint}", status.as_u16()),
+            });
+        }
+        Ok(body)
+    }
+
+    pub fn sample(&mut self) -> TelemetryData {
+        let started = Instant::now();
+        let mut data = TelemetryData::status(
+            ConnectionState::Live,
+            "Telemetry is live. Read-only monitoring.",
+        );
+        let result = self.sample_inner(&mut data);
+        if let Err(error) = result {
+            if data.llama_slots.is_none() {
+                self.tracker.counts.clear();
+            }
+            self.props_at = None;
+            data.connection = error.state;
+            data.detail = error.message;
+        }
+        data.latency = started.elapsed();
+        data
+    }
+
+    fn sample_inner(&mut self, data: &mut TelemetryData) -> Result<(), EndpointError> {
+        let health = self.get("/health")?;
+        if serde_json::from_str::<Value>(&health)
+            .ok()
+            .and_then(|v| v.get("status").and_then(Value::as_str).map(str::to_owned))
+            .as_deref()
+            != Some("ok")
+        {
+            return Err(EndpointError {
+                state: ConnectionState::Degraded,
+                message: "Invalid /health response; expected status: ok.".into(),
+            });
+        }
+        let slots = self.get("/slots")?;
+        data.sampled_at = Instant::now();
+        data.llama_slots = Some(self.tracker.parse(&slots, data.sampled_at).map_err(
+            |message| EndpointError {
+                state: ConnectionState::Degraded,
+                message,
+            },
+        )?);
+        if self
+            .props_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+        {
+            let props_json = self.get("/props")?;
+            let mut props: LlamaProps =
+                serde_json::from_str(&props_json).map_err(|_| EndpointError {
+                    state: ConnectionState::Degraded,
+                    message: "Invalid JSON/schema from /props; slot readings remain available."
+                        .into(),
+                })?;
+            props.model_name = safe_text(
+                props
+                    .model_name
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("Unknown model"),
+            );
+            if props.model_name.is_empty() {
+                props.model_name = "Unknown model".into();
+            }
+            props.build_info = props.build_info.map(|s| safe_text(&s));
+            self.props = Some(props);
+            self.props_at = Some(Instant::now());
+        }
+        data.llama_props = self.props.clone();
+        Ok(())
+    }
+}
+
+/// A capacity-one mailbox prevents UI stalls from growing telemetry memory.
+pub fn deliver<T>(tx: &SyncSender<T>, value: T) -> bool {
+    !matches!(tx.try_send(value), Err(TrySendError::Disconnected(_)))
+}
+
+pub struct Worker {
+    stopping: Arc<AtomicBool>,
+    control: SyncSender<()>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+impl Worker {
+    pub fn spawn<T: Send + 'static>(
+        interval: Duration,
+        mut sample: impl FnMut() -> T + Send + 'static,
+    ) -> (Self, Receiver<T>) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (control, commands) = mpsc::sync_channel(1);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stopping);
+        let handle = thread::spawn(move || loop {
+            if stopped.load(Ordering::Acquire) {
+                break;
+            }
+            let started = Instant::now();
+            if !deliver(&tx, sample()) {
+                break;
+            }
+            match commands.recv_timeout(interval.saturating_sub(started.elapsed())) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => continue,
+            }
+        });
+        (
+            Self {
+                stopping,
+                control,
+                handle: Some(handle),
+            },
+            rx,
+        )
+    }
+    pub fn retry(&self) {
+        let _ = self.control.try_send(());
+    }
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.control.try_send(());
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop();
+        // Close control before joining. Callers restore the terminal before dropping workers.
+        let (replacement, _) = mpsc::sync_channel(1);
+        drop(std::mem::replace(&mut self.control, replacement));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
