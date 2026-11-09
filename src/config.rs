@@ -6,6 +6,7 @@ pub const HELP: &str = "LlamaScope — a calm observatory for local inference
 
 USAGE
   llamascope [OPTIONS]
+  llamascope update [--check] [--version X.Y.Z]   Install the latest release build
 
 OPTIONS
   --url URL        llama-server base URL (default http://127.0.0.1:8086)

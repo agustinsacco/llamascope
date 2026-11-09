@@ -43,7 +43,7 @@ jobs:
         run: python3 tests/terminal_smoke.py
       - name: Launcher and installer contracts
         run: |
-          bash -n start.sh install.sh
+          bash -n start.sh && sh -n install.sh
           python3 tests/scripts_smoke.py
 
   msrv:

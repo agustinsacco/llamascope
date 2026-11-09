@@ -142,12 +142,13 @@ Normal `q` and Ctrl-C exits are exercised in a real pseudo-terminal. `SIGTERM`, 
 | `src/theme.rs` | Semantic Mocha and Latte palette tokens. |
 | `src/demo.rs` | Deterministic simulation and history seeding; no I/O. |
 | `src/main.rs` | Terminal ownership, worker wiring, signals, event loop. |
+| `src/update.rs` | `llamascope update`: fetch a GitHub release build, verify `SHA256SUMS`, test-run, atomic rename. |
 | `examples/snapshot.rs` | Export the actual Ratatui test buffer to SVG. |
 | `tests/` | Config, protocol, state, rendering, contrast, PTY, and script regression checks. |
 
 ## Privacy and trust boundaries
 
-LlamaScope performs only GET requests to the configured server and local sensor reads. It does not implement analytics, persistent history, inference submission, or server mutations. Network requests may follow the system’s proxy configuration; use trusted proxy settings and HTTPS where appropriate.
+LlamaScope performs only GET requests to the configured server and local sensor reads. The only other network access is `llamascope update`, which you run explicitly and which talks only to the GitHub API. It does not implement analytics, persistent history, inference submission, or server mutations. Network requests may follow the system’s proxy configuration; use trusted proxy settings and HTTPS where appropriate.
 
 Server bodies may contain sensitive fields even when LlamaScope does not display them. Responses are transiently read to decode telemetry; unknown fields are ignored, and raw response bodies are not logged. Model basenames, task IDs, server addresses, and operational measurements may appear on screen. Treat screenshots as potentially sensitive.
 
