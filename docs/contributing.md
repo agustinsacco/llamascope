@@ -27,7 +27,7 @@ cargo test --locked --all-targets
 cargo build --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 python3 tests/terminal_smoke.py
-bash -n start.sh install.sh
+bash -n start.sh && sh -n install.sh
 python3 tests/scripts_smoke.py
 ```
 
@@ -114,3 +114,11 @@ Prefer one concern per PR: a protocol fix, a sensor adapter, an interaction impr
 - [ ] Render, protocol, CLI, and surrounding quality gates pass.
 - [ ] Documentation commands were actually exercised where the environment permits.
 - [ ] Real-server and real-hardware limitations are explicitly stated.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml` (and `Cargo.lock` via `cargo build`), merge to `main`.
+2. Tag that commit and push the tag: `git tag v1.1.0 && git push origin v1.1.0`.
+3. The [Release workflow](../.github/workflows/release.yml) refuses a tag that does not match `Cargo.toml`, tests and builds static Linux (musl) and macOS binaries, and publishes them with `SHA256SUMS` and `install.sh`.
+
+`install.sh` and `llamascope update` both read `llamascope-<target>` and `SHA256SUMS` from the release, so keep those asset names stable.

@@ -5,6 +5,7 @@ use llamascope::{
     demo, hardware,
     hardware::HardwareTelemetry,
     telemetry::{Poller, TelemetryData, Worker},
+    update,
 };
 use std::{
     io::{self, IsTerminal},
@@ -19,6 +20,53 @@ use std::{
 type Source<T> = (Worker, Receiver<T>);
 type Sensors = Source<(HardwareTelemetry, Instant)>;
 
+/// `llamascope update`: the token comes from GH_TOKEN, GITHUB_TOKEN, or `gh auth token`.
+fn self_update(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = args.collect();
+    if args.iter().any(|s| matches!(s.as_str(), "--help" | "-h")) {
+        println!("{}", update::USAGE);
+        return Ok(());
+    }
+    let options = update::Options::parse(args)?;
+    let target = update::target()
+        .ok_or("No release builds exist for this platform; use install.sh --source.")?;
+    let env = |name| {
+        std::env::var(name)
+            .ok()
+            .filter(|v: &String| !v.trim().is_empty())
+    };
+    let token = env("GH_TOKEN").or_else(|| env("GITHUB_TOKEN")).or_else(|| {
+        let output = std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .ok()?;
+        let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        (output.status.success() && !token.is_empty()).then_some(token)
+    });
+    let source = update::Source {
+        api: update::API,
+        repository: update::REPOSITORY,
+        token,
+        target,
+        current: env!("CARGO_PKG_VERSION"),
+        executable: std::env::current_exe()?,
+    };
+    let current = source.current;
+    match update::run(&options, &source)? {
+        update::Outcome::UpToDate(latest) => {
+            println!("LlamaScope {current} is up to date (latest {latest}).")
+        }
+        update::Outcome::Available(latest) => {
+            println!("LlamaScope {latest} is available (running {current}). Run: llamascope update")
+        }
+        update::Outcome::Updated(latest) => println!(
+            "Updated {} from {current} to {latest}. Restart running dashboards to use it.",
+            source.executable.display()
+        ),
+    }
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = start() {
         eprintln!("LlamaScope: {error}");
@@ -28,6 +76,9 @@ fn main() {
 
 fn start() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("update") {
+        return self_update(args.into_iter().skip(1));
+    }
     if args.iter().any(|s| matches!(s.as_str(), "--help" | "-h")) {
         println!("{HELP}");
         return Ok(());
