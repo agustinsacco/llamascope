@@ -1,62 +1,124 @@
 name: Release
 
-# Push a tag that matches Cargo.toml, e.g. `git tag v1.1.0 && git push origin v1.1.0`.
-# Publishes static Linux (musl) and macOS binaries, SHA256SUMS, and install.sh.
+# Every green Quality run on main publishes a release, like Phosphor's continuous
+# release. Triggering on workflow_run means a red build can never publish, and the
+# test matrix is not repeated here.
+#
+# Version: <major>.<minor> from Cargo.toml, patch = commits on main. It always
+# increases and needs no version-bump commit. A `Skip-Release: true` git trailer
+# merges without shipping. Run by hand to (re)release the exact main commit; that
+# also requires its Quality run to have passed.
+#
+# Install: curl -fsSL https://github.com/agustinsacco/llamascope/releases/latest/download/install.sh | sh
 on:
-  push:
-    tags: ["v*.*.*"]
+  workflow_run:
+    workflows: [Quality]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Ineligible runs (red CI, other refs) get a group of their own and can never
+  # displace a queued release.
+  group: ${{ ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository)) && 'release' || github.run_id }}
   cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Decide whether to release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    outputs:
+      sha: ${{ steps.decide.outputs.sha }}
+      version: ${{ steps.decide.outputs.version }}
+      ship: ${{ steps.decide.outputs.ship }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The exact commit Quality validated, with history for the commit count.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pick the version and decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            conclusion=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main \
+              --event push --commit "$sha" --limit 1 --json conclusion --jq '.[0].conclusion // ""')
+            [[ "$conclusion" == success ]] || { echo "::error::Quality has not passed on $sha"; exit 1; }
+          fi
+          minor=$(sed -n 's/^version = "\([0-9]*\.[0-9]*\)\.[0-9]*"/\1/p' Cargo.toml | head -n 1)
+          [[ -n "$minor" ]] || { echo "::error::Cannot read the version from Cargo.toml"; exit 1; }
+          version="$minor.$(git rev-list --count HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A git trailer, not prose: text that merely mentions the directive cannot trigger it.
+          skip=$(git log -1 --format=%B | git interpret-trailers --only-trailers --unfold \
+            | sed -n 's/^[Ss]kip-[Rr]elease:[[:space:]]*//p' | tail -n 1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          ship=true
+          if [[ "$EVENT" == workflow_run && "$skip" =~ ^(true|yes|1)$ ]]; then
+            ship=false; echo "::notice::Skip-Release trailer present; not publishing v$version."
+          elif git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            ship=false; echo "::notice::v$version already exists; nothing to publish."
+          fi
+          echo "ship=$ship" >> "$GITHUB_OUTPUT"
+          echo "::notice::LlamaScope $version from ${sha:0:7}: ship=$ship"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: plan
+    if: needs.plan.outputs.ship == 'true'
     strategy:
       fail-fast: true
       matrix:
         include:
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
-          - { target: x86_64-apple-darwin, os: macos-latest }
-          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, run: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, run: true }
+          - { target: aarch64-apple-darwin, os: macos-latest, run: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, run: false }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      LLAMASCOPE_VERSION: ${{ needs.plan.outputs.version }}
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
-      - name: Tag matches Cargo.toml
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          test "v$version" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME does not match Cargo.toml $version"; exit 1; }
       - name: Set up Rust
         run: |
-          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup toolchain install stable --profile minimal --target "$TARGET"
           rustup default stable
       - name: musl toolchain
         if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update && sudo apt-get install -y musl-tools
-          target=${{ matrix.target }}
-          echo "CC_${target//-/_}=musl-gcc" >> "$GITHUB_ENV"
-      - name: Test
-        if: "!contains(matrix.target, 'x86_64-apple')"
-        run: cargo test --locked --all-targets
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         run: |
-          cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --target "$TARGET"
           mkdir dist
-          cp target/${{ matrix.target }}/release/llamascope dist/llamascope-${{ matrix.target }}
-      - name: Smoke test the release binary
-        if: "!contains(matrix.target, 'x86_64-apple')"
+          cp "target/$TARGET/release/llamascope" "dist/llamascope-$TARGET"
+      - name: The binary reports its version and is static on Linux
+        if: matrix.run
         run: |
-          test "$(dist/llamascope-${{ matrix.target }} --version)" = "LlamaScope ${GITHUB_REF_NAME#v}"
-          if [ "$RUNNER_OS" = Linux ]; then ! ldd dist/llamascope-${{ matrix.target }} 2>/dev/null | grep -q '=>'; fi
+          test "$("dist/llamascope-$TARGET" --version)" = "LlamaScope $LLAMASCOPE_VERSION"
+          if [ "$RUNNER_OS" = Linux ]; then ! ldd "dist/llamascope-$TARGET" 2>/dev/null | grep -q '=>'; fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: llamascope-${{ matrix.target }}
@@ -64,27 +126,55 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish GitHub release
-    needs: build
+    name: Publish v${{ needs.plan.outputs.version }}
+    needs: [plan, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v${{ needs.plan.outputs.version }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums
+      - name: Checksums and installer
         run: |
+          set -euo pipefail
           cp install.sh dist/install.sh
-          cd dist && sha256sum llamascope-* install.sh > SHA256SUMS && cat SHA256SUMS
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          cd dist
+          [ "$(ls llamascope-* | wc -l)" -eq 4 ]
+          sha256sum llamascope-* install.sh > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish as latest
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" --title "LlamaScope ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag
+          set -euo pipefail
+          # A draft left by a failed run has no tag yet; replace it.
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          # Upload everything to a draft first, so `latest` never points at a partial release.
+          previous=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$SHA" --draft \
+            --title "LlamaScope $VERSION" --generate-notes ${previous:+--notes-start-tag "$previous"}
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+      - name: The published installer works
+        run: |
+          set -euo pipefail
+          prefix=$(mktemp -d)
+          # The latest redirect can lag the publish by a few seconds.
+          for attempt in 1 2 3 4 5 6; do
+            curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh" | PREFIX="$prefix" sh || true
+            [ "$("$prefix/bin/llamascope" --version 2>/dev/null)" = "LlamaScope $VERSION" ] && exit 0
+            sleep 10
+          done
+          echo "::error::install.sh did not install $VERSION"; exit 1

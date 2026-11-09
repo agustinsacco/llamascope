@@ -22,7 +22,7 @@ pub const USAGE: &str = "USAGE
   --check          Report whether a newer release exists; change nothing
   --version X.Y.Z  Install that release (also allows downgrades)
 
-Private repository? Set GH_TOKEN or GITHUB_TOKEN, or sign in with gh.";
+GH_TOKEN, GITHUB_TOKEN, or a gh sign-in is used if present (higher API rate limit).";
 
 /// Release binaries are statically linked on Linux, so any Linux host uses musl builds.
 pub fn target() -> Option<&'static str> {
@@ -104,7 +104,7 @@ const LIMIT: u64 = 128 * 1024 * 1024;
 
 fn client() -> Result<Client, String> {
     Client::builder()
-        .user_agent(concat!("llamascope/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("llamascope/{}", crate::VERSION))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
         .build()
@@ -125,13 +125,10 @@ fn get(client: &Client, source: &Source, url: &str, accept: &str) -> Result<Vec<
         .map_err(|_| "Cannot reach GitHub. Check the network and retry.".to_owned())?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(match source.token {
-            Some(_) => format!("No matching release is published at {}.", source.repository),
-            None => format!(
-                "Release not found at {}. If the repository is private, set GH_TOKEN or sign in with gh.",
-                source.repository
-            ),
-        });
+        return Err(format!(
+            "No matching release is published at {}.",
+            source.repository
+        ));
     }
     if !status.is_success() {
         return Err(format!("GitHub returned HTTP {}.", status.as_u16()));
