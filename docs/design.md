@@ -46,7 +46,7 @@ The contrast regression test computes sRGB relative luminance and requires **at 
 | At least 33 rows | Event stream fits in the main panel; at smaller heights it is hidden, not deleted. |
 | Below the sidebar threshold | Full-width inference view; local data still collects but its panels are hidden. |
 | Slot-table inner width at least 85 columns | Include generated-token and task columns. |
-| Narrower table | Keep slot, phase, TOK/S, prefill, and context estimate. |
+| Narrower table | Keep slot, phase, TOK/S, prompt, and context. |
 | Fewer than `60 × 18` | Show an explicit minimum-size guide; retain state and quit controls. |
 
 A selected row has a distinct background, bold treatment, and `›` marker. The table scrolls to keep selection visible. Selecting by ID preserves focus when the server reorders rows; selecting a removed slot falls back to the first remaining slot.

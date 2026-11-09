@@ -5,3 +5,4 @@ pub mod demo;
 pub mod hardware;
 pub mod telemetry;
 pub mod theme;
+pub mod ui;

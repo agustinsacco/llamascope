@@ -10,7 +10,7 @@ use ratatui::{
     style::{Color, Modifier},
     Terminal,
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn color(color: Color) -> String {
     match color {
@@ -45,14 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode,
         "demo" | "help" | "frozen" | "degraded" | "hardware-missing"
     ) {
-        state.started_at = Instant::now() - Duration::from_secs(60);
-        state.demo = true;
-        for tick in 0..120 {
-            let (data, hardware) = demo::sample(tick, state.started_at);
-            let at = data.sampled_at;
-            state.update(data);
-            state.update_hardware(hardware, at);
-        }
+        demo::seed(&mut state);
         state.log(
             false,
             "Explore the signal. Tab selects a slot; ? opens the field guide.",

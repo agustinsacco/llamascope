@@ -133,6 +133,15 @@ class Terminal:
 
     def quit(self, key=b"q"):
         self.send(key)
+        self.await_exit()
+
+    def terminate(self, sig):
+        """Signal the app itself (the session leader is its parent and must survive)."""
+        app = subprocess.run(["pgrep", "-P", str(self.pid)], capture_output=True, text=True, check=True)
+        os.kill(int(app.stdout.split()[0]), sig)
+        self.await_exit()
+
+    def await_exit(self):
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if select.select([self.status_read], [], [], 0)[0]:
@@ -201,6 +210,17 @@ def ctrl_c_check():
         terminal.close()
 
 
+def signal_check():
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        terminal = Terminal(["--demo"])
+        try:
+            terminal.wait("DEMO")
+            terminal.terminate(sig)
+        finally:
+            terminal.close()
+    print("PASS SIGTERM / SIGHUP: clean exit and terminal restoration")
+
+
 def recovery_check():
     class Handler(http.server.BaseHTTPRequestHandler):
         mode = "loading"
@@ -265,4 +285,5 @@ if __name__ == "__main__":
     assert BINARY.is_file(), f"Build the app first: cargo build --locked ({BINARY})"
     demo_check()
     ctrl_c_check()
+    signal_check()
     recovery_check()

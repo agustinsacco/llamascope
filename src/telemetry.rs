@@ -25,6 +25,31 @@ pub enum ConnectionState {
     Offline,
 }
 
+/// What a slot is doing, derived only from counters llama-server reliably reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Idle,
+    /// Busy with no generated token yet: prompt ingestion (or an embedding pass).
+    Prefill,
+    Decoding,
+    /// Busy, but the generated-token counter is missing.
+    Working,
+}
+
+impl Phase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Prefill => "Prefill",
+            Self::Decoding => "Decoding",
+            Self::Working => "Working",
+        }
+    }
+}
+
+/// One `/slots` entry. Current llama-server semantics:
+/// `n_prompt_tokens` is every token held in the slot (cached + ingested prompt + generated),
+/// `n_prompt_tokens_processed` excludes prompt-cache hits (`n_prompt_tokens_cache`).
 #[derive(Clone, Debug, Default)]
 pub struct LlamaSlot {
     pub id: u32,
@@ -33,47 +58,42 @@ pub struct LlamaSlot {
     pub n_ctx: Option<u64>,
     pub n_prompt_tokens: Option<u64>,
     pub n_prompt_tokens_processed: Option<u64>,
+    pub n_prompt_tokens_cache: Option<u64>,
     pub n_decoded: Option<u64>,
     pub n_remain: Option<i64>,
     pub tps: Option<f64>,
 }
 
 impl LlamaSlot {
-    pub fn phase(&self) -> &'static str {
-        if !self.busy {
-            "Idle"
-        } else if matches!((self.n_prompt_tokens_processed, self.n_prompt_tokens), (Some(a), Some(b)) if a < b)
-        {
-            "Prefill"
-        } else if self.n_decoded.is_some_and(|n| n > 0) {
-            "Decoding"
-        } else {
-            "Working"
+    pub fn phase(&self) -> Phase {
+        match (self.busy, self.n_decoded) {
+            (false, _) => Phase::Idle,
+            (true, Some(0)) => Phase::Prefill,
+            (true, Some(_)) => Phase::Decoding,
+            (true, None) => Phase::Working,
         }
     }
-    /// A token-count estimate, not measured physical KV memory allocation.
-    pub fn kv_percent(&self) -> Option<f64> {
-        let ctx = self.n_ctx.filter(|n| *n > 0)?;
-        let used = self
-            .n_prompt_tokens_processed?
-            .saturating_add(self.n_decoded?);
-        Some((used as f64 / ctx as f64 * 100.0).clamp(0.0, 100.0))
+    /// Prompt tokens ingested so far: freshly processed plus reused cache, when reported.
+    /// The server does not report the full prompt length, so there is no honest percentage.
+    pub fn prompt_tokens(&self) -> Option<u64> {
+        Some(
+            self.n_prompt_tokens_processed?
+                .saturating_add(self.n_prompt_tokens_cache.unwrap_or(0)),
+        )
     }
-    pub fn prompt_percent(&self) -> Option<f64> {
-        let total = self.n_prompt_tokens.filter(|n| *n > 0)?;
-        Some((self.n_prompt_tokens_processed? as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+    /// Tokens held in the slot over its context size. A token count, not physical KV bytes.
+    pub fn context_percent(&self) -> Option<f64> {
+        let ctx = self.n_ctx.filter(|n| *n > 0)?;
+        Some((self.n_prompt_tokens? as f64 / ctx as f64 * 100.0).clamp(0.0, 100.0))
     }
 }
 
+/// Only the `/props` fields LlamaScope displays; everything else is optional and ignored.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct LlamaProps {
     #[serde(default, rename = "model_path")]
     pub model_name: String,
-    pub total_slots: u32,
-    pub queue_size: Option<u32>,
     pub build_info: Option<String>,
-    #[serde(default)]
-    pub is_sleeping: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +138,7 @@ struct RawSlot {
     n_ctx: Option<u64>,
     n_prompt_tokens: Option<u64>,
     n_prompt_tokens_processed: Option<u64>,
+    n_prompt_tokens_cache: Option<u64>,
     next_token: Option<NextToken>,
 }
 
@@ -185,6 +206,7 @@ impl SlotTracker {
                 n_ctx: s.n_ctx,
                 n_prompt_tokens: s.n_prompt_tokens,
                 n_prompt_tokens_processed: s.n_prompt_tokens_processed,
+                n_prompt_tokens_cache: s.n_prompt_tokens_cache,
                 n_decoded: decoded,
                 n_remain: token.and_then(|t| t.n_remain),
                 tps,
@@ -196,11 +218,22 @@ impl SlotTracker {
     }
 }
 
-/// Prevent server-provided text from injecting terminal controls or unbounded labels.
+/// Prevent server-provided text from injecting terminal controls, direction overrides,
+/// line breaks, or unbounded labels.
 pub fn safe_text(text: &str) -> String {
     text.chars()
         .filter(|c| {
-            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            !c.is_control()
+                && !matches!(
+                    *c,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
         })
         .take(160)
         .collect()

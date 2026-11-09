@@ -95,3 +95,15 @@ fn noninteractive_startup_exits_cleanly_without_escape_sequences() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
     assert!(!output.stdout.contains(&0x1b));
 }
+#[test]
+fn exported_but_empty_variables_mean_unset() {
+    let config = Config::parse(std::iter::empty(), |name| match name {
+        "LLAMA_API_URL" | "LLAMASCOPE_THEME" => Some(String::new()),
+        "LLAMA_API_KEY" => Some("  ".into()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(config.api_url, "http://127.0.0.1:8086");
+    assert_eq!(config.theme, Theme::Mocha);
+    assert_eq!(config.api_key, None);
+}

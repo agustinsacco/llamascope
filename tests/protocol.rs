@@ -1,7 +1,6 @@
 use llamascope::{
     config::Config,
-    hardware::{parse_meminfo, parse_rocm, parse_vm_stat, GpuTelemetry},
-    telemetry::{safe_text, ConnectionState, LlamaSlot, Poller, SlotTracker, Worker},
+    telemetry::{safe_text, ConnectionState, LlamaSlot, Phase, Poller, SlotTracker, Worker},
 };
 use std::{
     io::{Read, Write},
@@ -10,8 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CURRENT: &str = include_str!("fixtures/slots-current.json");
-const LEGACY: &str = include_str!("fixtures/slots-legacy.json");
+const LIVE: &str = include_str!("fixtures/slots-live.json");
+const OBJECT: &str = include_str!("fixtures/slots-object.json");
 const PROPS: &str = include_str!("fixtures/props.json");
 const HEALTH: &str = r#"{"status":"ok"}"#;
 
@@ -22,28 +21,51 @@ fn raw(task: u64, count: u64, busy: bool) -> String {
 }
 
 #[test]
-fn current_object_and_unlimited_generation_are_supported() {
+fn live_array_shape_reports_phase_prompt_and_context() {
+    let slots = SlotTracker::default().parse(LIVE, Instant::now()).unwrap();
+    let [prefill, cached, idle] = &slots[..] else {
+        panic!("three slots expected");
+    };
+    // n_prompt_tokens runs ahead of processed during prefill; that is not a percentage.
+    assert_eq!(prefill.phase(), Phase::Prefill);
+    assert_eq!(prefill.prompt_tokens(), Some(69632));
+    assert_eq!(prefill.context_percent(), Some(71680.0 / 131072.0 * 100.0));
+    // Generated tokens also grow n_prompt_tokens; generation is still Decoding.
+    assert_eq!(cached.phase(), Phase::Decoding);
+    assert_eq!(cached.n_remain, Some(-1));
+    assert_eq!(
+        cached.prompt_tokens(),
+        Some(9088),
+        "cache hits count as prompt"
+    );
+    assert_eq!(cached.context_percent(), Some(9408.0 / 32768.0 * 100.0));
+    assert_eq!(idle.phase(), Phase::Idle);
+    assert_eq!(idle.task_id.as_deref(), Some("190"));
+}
+#[test]
+fn object_shape_without_prompt_counters_stays_unknown() {
     let slots = SlotTracker::default()
-        .parse(CURRENT, Instant::now())
+        .parse(OBJECT, Instant::now())
         .unwrap();
     assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0].phase(), Phase::Decoding);
     assert_eq!(slots[0].n_decoded, Some(136));
     assert_eq!(slots[0].n_remain, Some(-1));
     assert_eq!(slots[0].tps, None);
-    assert_eq!(
-        slots[0].kv_percent(),
-        None,
-        "missing prompt metrics must not become zero"
-    );
+    assert_eq!(slots[0].prompt_tokens(), None, "missing is not zero");
+    assert_eq!(slots[0].context_percent(), None, "missing is not zero");
 }
 #[test]
-fn legacy_array_retains_prefill_and_context() {
-    let slots = SlotTracker::default()
-        .parse(LEGACY, Instant::now())
-        .unwrap();
-    assert_eq!(slots[0].phase(), "Prefill");
-    assert_eq!(slots[0].prompt_percent(), Some(50.0));
-    assert_eq!(slots[0].kv_percent(), Some(25.0));
+fn phase_follows_busy_and_generated_counters() {
+    let slot = |busy, n_decoded| LlamaSlot {
+        busy,
+        n_decoded,
+        ..Default::default()
+    };
+    assert_eq!(slot(false, Some(9)).phase(), Phase::Idle);
+    assert_eq!(slot(true, Some(0)).phase(), Phase::Prefill);
+    assert_eq!(slot(true, Some(1)).phase(), Phase::Decoding);
+    assert_eq!(slot(true, None).phase(), Phase::Working);
 }
 #[test]
 fn sampled_tps_uses_elapsed_time_and_task_identity() {
@@ -132,19 +154,19 @@ fn malformed_or_duplicate_slots_are_errors_not_empty_success() {
 fn context_math_is_overflow_safe_and_bounded() {
     let slot = LlamaSlot {
         n_ctx: Some(2),
+        n_prompt_tokens: Some(u64::MAX),
         n_prompt_tokens_processed: Some(u64::MAX),
-        n_prompt_tokens: Some(1),
-        n_decoded: Some(u64::MAX),
+        n_prompt_tokens_cache: Some(u64::MAX),
         ..Default::default()
     };
-    assert_eq!(slot.kv_percent(), Some(100.0));
-    assert_eq!(slot.prompt_percent(), Some(100.0));
+    assert_eq!(slot.context_percent(), Some(100.0));
+    assert_eq!(slot.prompt_tokens(), Some(u64::MAX));
     assert_eq!(
         LlamaSlot {
             n_ctx: Some(0),
             ..slot
         }
-        .kv_percent(),
+        .context_percent(),
         None
     );
 }
@@ -175,6 +197,26 @@ fn terminal_text_is_bounded_and_cannot_inject_control_codes() {
     assert!(!text.chars().any(char::is_control));
     assert!(!text.contains('\u{202e}'));
     assert_eq!(text.chars().count(), 160);
+    let marks = safe_text("a\u{200e}b\u{200f}c\u{061c}d\u{2028}e\u{2066}f");
+    assert_eq!(
+        marks, "abcdef",
+        "direction marks and line separators are stripped"
+    );
+}
+#[test]
+fn minimal_props_with_only_a_model_path_is_live_not_degraded() {
+    let (url, server) = server(
+        vec![
+            reply("/health", 200, HEALTH),
+            reply("/slots", 200, LIVE),
+            reply("/props", 200, r#"{"model_path":"/m/only.gguf"}"#),
+        ],
+        Duration::ZERO,
+    );
+    let data = poller(url).sample();
+    assert_eq!(data.connection, ConnectionState::Live);
+    assert_eq!(data.llama_props.unwrap().model_name, "only.gguf");
+    server.join().unwrap();
 }
 
 /// Loopback-only fixtures; every expected request has a deadline and is asserted to be GET.
@@ -245,10 +287,10 @@ fn test_model_name_extraction_and_metadata_cache() {
     let (url, server) = server(
         vec![
             reply("/health", 200, HEALTH),
-            reply("/slots", 200, CURRENT),
+            reply("/slots", 200, LIVE),
             reply("/props", 200, PROPS),
             reply("/health", 200, HEALTH),
-            reply("/slots", 200, CURRENT),
+            reply("/slots", 200, LIVE),
         ],
         Duration::ZERO,
     );
@@ -257,10 +299,7 @@ fn test_model_name_extraction_and_metadata_cache() {
     assert_eq!(first.connection, ConnectionState::Live);
     let props = first.llama_props.unwrap();
     assert_eq!(props.model_name, "test-model-q8_0.gguf");
-    assert_eq!(
-        props.queue_size, None,
-        "stock /props does not report a queue"
-    );
+    assert_eq!(props.build_info.as_deref(), Some("b12345-test"));
     assert_eq!(poller.sample().connection, ConnectionState::Live);
     assert_eq!(server.join().unwrap().len(), 5, "props should be cached");
 }
@@ -337,7 +376,7 @@ fn partial_props_failure_preserves_live_slot_rates() {
             reply("/props", 500, "{}"),
             reply("/health", 200, HEALTH),
             reply("/slots", 200, &raw(1, 20, true)),
-            reply("/props", 200, "{}"),
+            reply("/props", 200, "[]"),
         ],
         Duration::ZERO,
     );
@@ -443,39 +482,17 @@ fn worker_mailbox_is_bounded() {
     drop(rx);
     assert!(!llamascope::telemetry::deliver(&tx, 1001));
 }
-
 #[test]
-fn test_parse_json_f64() {
-    let gpu = parse_rocm(r#"{"card0":{"GPU use (%)":"45.2","Temperature (Sensor edge) (C)":120.5,"Current Socket Graphics Package Power (W)":"invalid"}}"#).unwrap();
-    assert_eq!(gpu.usage, Some(45.2));
-    assert_eq!(gpu.temp, Some(120.5));
-    assert_eq!(gpu.power, None, "unavailable readings are not zero watts");
-    assert!(parse_rocm(r#"{"card0":{"GPU use (%)":"NaN"}}"#).is_none());
-}
-#[test]
-fn test_gpu_telemetry_default() {
-    let gpu = GpuTelemetry::default();
-    assert!(gpu.usage.is_none() && gpu.temp.is_none() && gpu.vram.is_none());
-}
-#[test]
-fn rocm_values_are_clamped_and_memory_is_gib() {
-    let gpu = parse_rocm(r#"{"card0":{"GPU use (%)":"120","VRAM Total Memory (B)":"2147483648","VRAM Total Used Memory (B)":"1073741824"}}"#).unwrap();
-    assert_eq!(gpu.usage, Some(100.0));
-    let memory = gpu.vram.unwrap();
-    assert_eq!(memory.used_gib, 1.0);
-    assert_eq!(memory.percent(), 50.0);
-}
-#[test]
-fn linux_memory_does_not_depend_on_a_gpu() {
-    let memory = parse_meminfo("MemTotal: 8388608 kB\nMemAvailable: 2097152 kB\n").unwrap();
-    assert_eq!(memory.total_gib, 8.0);
-    assert_eq!(memory.used_gib, 6.0);
-    assert!(parse_meminfo("MemTotal: 1 kB\nMemAvailable: 2 kB").is_none());
-    assert!(parse_meminfo("MemTotal: NaN kB\nMemAvailable: 0 kB").is_none());
-}
-#[test]
-fn macos_memory_uses_the_reported_page_size() {
-    let memory = parse_vm_stat("1073741824", "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 16384.\nPages inactive: 16384.\nPages speculative: 0.\n").unwrap();
-    assert_eq!(memory.total_gib, 1.0);
-    assert_eq!(memory.used_gib, 0.5);
+fn reverse_proxy_path_prefixes_every_endpoint() {
+    let (url, server) = server(
+        vec![
+            reply("/llama/health", 200, HEALTH),
+            reply("/llama/slots", 200, LIVE),
+            reply("/llama/props", 200, PROPS),
+        ],
+        Duration::ZERO,
+    );
+    let data = poller(format!("{url}/llama")).sample();
+    assert_eq!(data.connection, ConnectionState::Live);
+    server.join().unwrap();
 }
