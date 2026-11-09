@@ -125,10 +125,13 @@ fn get(client: &Client, source: &Source, url: &str, accept: &str) -> Result<Vec<
         .map_err(|_| "Cannot reach GitHub. Check the network and retry.".to_owned())?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(format!(
-            "Release not found at {}. If the repository is private, set GH_TOKEN or sign in with gh.",
-            source.repository
-        ));
+        return Err(match source.token {
+            Some(_) => format!("No matching release is published at {}.", source.repository),
+            None => format!(
+                "Release not found at {}. If the repository is private, set GH_TOKEN or sign in with gh.",
+                source.repository
+            ),
+        });
     }
     if !status.is_success() {
         return Err(format!("GitHub returned HTTP {}.", status.as_u16()));
