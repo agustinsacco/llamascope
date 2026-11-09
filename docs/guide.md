@@ -80,21 +80,23 @@ These are **observation-window rates**, not tokens divided by full request laten
 | Label | Rule |
 | --- | --- |
 | **Idle** | `is_processing` is false. |
-| **Prefill** | Busy, with reported processed prompt tokens less than total prompt tokens. |
-| **Decoding** | Busy, not known to be in prefill, with decoded tokens greater than zero. |
-| **Working** | Busy, but the exposed counters do not establish a more specific phase. |
+| **Prefill** | Busy, and no token has been generated yet (`n_decoded` is 0). |
+| **Decoding** | Busy, with generated tokens greater than zero. |
+| **Working** | Busy, but the server does not report a generated-token count. |
 
 The word **Working** is deliberate: no guessing that an undocumented state means prefill.
 
-### PREFILL
+### PROMPT
 
-`100 × n_prompt_tokens_processed / n_prompt_tokens`, clamped to `0–100%`. Both fields and a positive total are required. Missing counters are common on stock `/slots` responses; `--` does not mean the prompt is stuck.
+Prompt tokens ingested so far: `n_prompt_tokens_processed + n_prompt_tokens_cache` (cache hits count as ingested). Counts of ten thousand or more are shown as `45.1k`.
 
-### CTX EST. / Context estimate
+There is deliberately no prefill percentage. llama-server does not report the full prompt length in `/slots`: `n_prompt_tokens` is the number of tokens currently held in the slot, which grows during prefill and keeps growing while tokens are generated. A ratio of the two would hover near 100% and mislabel generation as prefill. A rising PROMPT count during **Prefill** is the progress signal.
 
-`100 × (processed prompt tokens + decoded tokens) / n_ctx`, using saturating integer addition and a clamped `0–100%` display.
+### CONTEXT
 
-This estimate requires all three counters and a positive context size. It is **not** physical KV allocation, a byte count, or an exact measurement after context shifting, cache reuse, or speculative decoding. The top card is the highest *known* value; an unknown slot is not interpreted as zero.
+`100 × n_prompt_tokens / n_ctx`, clamped to `0–100%`: the tokens held in the slot (reused cache, ingested prompt, and generated tokens) over the slot's context size.
+
+This is a token count, **not** physical KV allocation or bytes, and it is approximate after context shifting or speculative decoding. Both fields and a positive context size are required. The top card is the fullest *known* slot; an unknown slot is not interpreted as zero.
 
 ### Generated tokens
 
@@ -109,24 +111,25 @@ Wall-clock duration of the HTTP collection cycle, not model latency and not GPU 
 - **Units:** memory is GiB (`1024³` bytes), not decimal GB. Linux `/proc/meminfo` values are converted from KiB.
 - **Linux RAM:** `MemTotal − MemAvailable`; this avoids treating all reclaimable page cache as unavailable.
 - **macOS RAM:** total from `sysctl`; estimated used memory subtracts free, inactive, and speculative pages using `vm_stat`’s reported page size. It is not Activity Monitor’s “Memory Pressure” metric and will not necessarily match its accounting.
-- **GPU:** optional `rocm-smi -a --json`, reading `card0`. Individual missing/non-numeric sensors remain unavailable. VRAM values are reported only when both used and total are valid.
+- **GPU:** the first tool that answers, in order: `rocm-smi --showuse --showtemp --showpower --showmeminfo vram gtt --json` (AMD `card0`), then `nvidia-smi --query-gpu=... --format=csv` (GPU 0). The panel names the source. Individual missing or non-numeric sensors (`N/A`) remain unavailable. Memory values are reported only when both used and total are valid.
+- **GTT (AMD):** system memory mapped for the GPU. On APUs such as Strix Halo, model weights live here rather than in the small VRAM carve-out, so GTT is the number to watch.
 - **Scope:** all hardware panels describe the machine **running LlamaScope**, even if `--url` points elsewhere. Monitor remotely over SSH if you want sensors from the inference host.
 - **Cadence:** local hardware is sampled independently every two seconds. No GPU utility is required for RAM or inference telemetry.
 
-There is no NVIDIA, Apple GPU, multi-GPU aggregation, remote sensor agent, or automatic thermal-throttling detection in this version.
+There is no Apple GPU, multi-GPU aggregation, remote sensor agent, or automatic thermal-throttling detection in this version. If the sensor collector itself fails, the GPU panel says so and server monitoring continues.
 
 ### Queue and metadata
 
-Model basename and build metadata come from `/props`, refreshed every 30 seconds during healthy polling. Failures trigger retries. Queue depth is shown only if `queue_size` is actually present; standard llama.cpp `/props` may omit it. LlamaScope does not synthesize a queue from busy slots and does not query Prometheus metrics.
+Model basename and build metadata come from `/props`, refreshed every 30 seconds during healthy polling. Failures trigger retries. Only `model_path` and `build_info` are read; every other field is optional, so a minimal `/props` still counts as healthy. llama-server does not report queue depth there, so LlamaScope shows none rather than synthesizing one from busy slots, and it does not query Prometheus metrics.
 
 ## Three investigations worth trying
 
 ### “My first token takes forever.”
 
 1. Is the server **MODEL LOADING**? That is model startup, not prompt processing.
-2. Is the slot **Prefill**? Inspect prompt progress if your server exposes it.
+2. Is the slot **Prefill**? Watch the PROMPT count rise; it includes reused prompt cache.
 3. Compare long and short prompts under the same model and batch configuration.
-4. If prompt counters are absent, use server logs or request timing instrumentation. Do not infer prefill duration from a flat throughput chart alone.
+4. For prefill duration, use server logs or request timing instrumentation. Do not infer prefill duration from a flat throughput chart alone.
 
 ### “Throughput falls as the conversation grows.”
 

@@ -45,7 +45,7 @@ impl Theme {
                 raised: Rgb(49, 50, 68),
                 text: Rgb(205, 214, 244),
                 muted: Rgb(166, 173, 200),
-                border: Rgb(88, 91, 112),
+                border: Rgb(108, 112, 134),
                 accent: Rgb(137, 180, 250),
                 good: Rgb(166, 227, 161),
                 warning: Rgb(249, 226, 175),
