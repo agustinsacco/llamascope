@@ -37,49 +37,53 @@ with tempfile.TemporaryDirectory(prefix="llamascope-scripts-") as directory:
         assert result.returncode != 0, f"{script} swallowed a Cargo failure"
         assert b"Installed. Try" not in result.stdout
 
-    # Release install, piped into sh as `curl ... | sh` does, against a loopback GitHub API.
+    # Release install, piped into sh as `curl ... | sh` does, against loopback release downloads.
     system, machine = platform.system(), platform.machine()
     target = {("Linux", "x86_64"): "x86_64-unknown-linux-musl", ("Linux", "aarch64"): "aarch64-unknown-linux-musl",
               ("Darwin", "x86_64"): "x86_64-apple-darwin", ("Darwin", "arm64"): "aarch64-apple-darwin"}[(system, machine)]
     binary = b"#!/bin/sh\necho 'LlamaScope 1.2.3'\n"
-    files = {"/asset/1": binary, "/asset/2": f"{hashlib.sha256(binary).hexdigest()}  llamascope-{target}\n".encode()}
+    sums = f"{hashlib.sha256(binary).hexdigest()}  llamascope-{target}\n".encode()
     seen = []
 
-    class GitHub(http.server.BaseHTTPRequestHandler):
+    class Releases(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            seen.append((self.path, self.headers.get("Authorization")))
-            base = f"http://127.0.0.1:{self.server.server_port}"
-            release = {"url": f"{base}/repos/o/r/releases/1", "tag_name": "v1.2.3", "body": "notes, with commas", "assets": [
-                {"url": f"{base}/repos/o/r/releases/assets/{n}", "name": name, "uploader": {"url": f"{base}/users/x"}}
-                for n, name in [(1, f"llamascope-{target}"), (2, "SHA256SUMS")]]}
-            path = self.path.replace("/repos/o/r/releases/assets", "/asset")
-            body = files.get(path) or json.dumps(release, indent=2).encode()
-            self.send_response(200 if path in files or path.endswith(("/latest", "/tags/v1.2.3")) else 404)
-            self.send_header("Content-Length", str(len(body)))
+            seen.append(self.path)
+            if self.path.startswith(("/latest/download/", "/download/v1.2.3/")):
+                # GitHub answers release downloads with a redirect to its asset host.
+                self.send_response(302)
+                self.send_header("Location", "/assets/" + self.path.rsplit("/", 1)[1])
+                self.end_headers()
+                return
+            body = {"/assets/SHA256SUMS": sums, f"/assets/llamascope-{target}": binary}.get(self.path)
+            self.send_response(404 if body is None else 200)
+            self.send_header("Content-Length", str(len(body or b"")))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(body or b"")
 
         def log_message(self, *_): pass
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GitHub)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Releases)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    release_env = {**env, "LLAMASCOPE_REPO": "o/r", "LLAMASCOPE_API": f"http://127.0.0.1:{server.server_port}", "GH_TOKEN": "t0ken"}
+    release_env = {**env, "LLAMASCOPE_RELEASES": f"http://127.0.0.1:{server.server_port}"}
     script = (ROOT / "install.sh").read_bytes()
+    installed = home / "custom prefix" / "bin" / "llamascope"
+    install = lambda *args: subprocess.run(["sh", "-s", "--", *args], input=script, cwd=home, env=release_env, capture_output=True)
     try:
-        subprocess.run(["sh"], input=script, cwd=home, env=release_env, check=True, capture_output=True)
-        installed = home / "custom prefix" / "bin" / "llamascope"
+        result = install()
+        assert result.returncode == 0, result.stderr
         assert installed.read_bytes() == binary and os.access(installed, os.X_OK)
-        assert seen[0] == ("/repos/o/r/releases/latest", "Bearer t0ken"), seen
-        subprocess.run(["sh", "-s", "--", "--version", "1.2.3"], input=script, cwd=home, env=release_env, check=True, capture_output=True)
-        assert seen[-3][0] == "/repos/o/r/releases/tags/v1.2.3", seen
-        files["/asset/2"] = f"{'0' * 64}  llamascope-{target}\n".encode()
+        assert seen[0] == "/latest/download/SHA256SUMS", seen
+        assert install("--version", "1.2.3").returncode == 0
+        assert "/download/v1.2.3/SHA256SUMS" in seen
+        result = install("--version", "9.9.9")
+        assert result.returncode != 0 and b"cannot find release 9.9.9" in result.stderr, result.stderr
+        sums = f"{'0' * 64}  llamascope-{target}\n".encode()
         installed.write_bytes(b"old")
-        result = subprocess.run(["sh"], input=script, cwd=home, env=release_env, capture_output=True)
+        result = install()
         assert result.returncode != 0 and b"checksum mismatch" in result.stderr, result.stderr
         assert installed.read_bytes() == b"old"
-        result = subprocess.run(["sh", "-s", "--", "--version", "9.9.9"], input=script, cwd=home, env=release_env, capture_output=True)
-        assert result.returncode != 0 and b"cannot read release" in result.stderr, result.stderr
+        assert list(installed.parent.iterdir()) == [installed], "no staged leftovers"
     finally:
         server.shutdown()
 print("PASS scripts: arbitrary working directory, argument boundaries, custom prefix, no shell edits, failure propagation")
-print("PASS curl | sh install: latest and pinned releases, token header, checksum refusal, missing release")
+print("PASS curl | sh install: latest and pinned releases, redirects, checksum refusal, missing release")

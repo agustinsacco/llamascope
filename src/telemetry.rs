@@ -265,7 +265,7 @@ impl Poller {
             .connect_timeout(Duration::from_secs(1))
             .redirect(reqwest::redirect::Policy::none())
             .default_headers(headers)
-            .user_agent(concat!("llamascope/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("llamascope/{}", crate::VERSION))
             .build()?;
         Ok(Self {
             client,

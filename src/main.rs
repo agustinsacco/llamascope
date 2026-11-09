@@ -20,7 +20,7 @@ use std::{
 type Source<T> = (Worker, Receiver<T>);
 type Sensors = Source<(HardwareTelemetry, Instant)>;
 
-/// `llamascope update`: the token comes from GH_TOKEN, GITHUB_TOKEN, or `gh auth token`.
+/// `llamascope update`. An optional token (GH_TOKEN, GITHUB_TOKEN, `gh auth token`) only raises the API rate limit.
 fn self_update(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = args.collect();
     if args.iter().any(|s| matches!(s.as_str(), "--help" | "-h")) {
@@ -48,7 +48,7 @@ fn self_update(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::er
         repository: update::REPOSITORY,
         token,
         target,
-        current: env!("CARGO_PKG_VERSION"),
+        current: llamascope::VERSION,
         executable: std::env::current_exe()?,
     };
     let current = source.current;
@@ -87,7 +87,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|s| matches!(s.as_str(), "--version" | "-V"))
     {
-        println!("LlamaScope {}", env!("CARGO_PKG_VERSION"));
+        println!("LlamaScope {}", llamascope::VERSION);
         return Ok(());
     }
     let config = Config::parse(args, |name| std::env::var(name).ok())?;

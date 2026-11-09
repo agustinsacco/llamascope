@@ -71,18 +71,18 @@ Current llama.cpp builds expose `/slots` by default. Do not start the server wit
 ## Install once, observe often
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/agustinsacco/llamascope/main/install.sh | sh
+curl -fsSL https://github.com/agustinsacco/llamascope/releases/latest/download/install.sh | sh
 ~/.local/bin/llamascope --demo
 
 # Later: replace the binary with the newest release.
-llamascope update            # or: llamascope update --check / --version 1.1.0
+llamascope update            # or: llamascope update --check / --version X.Y.Z
 ```
 
-The installer downloads the release build for Linux (static, x86_64 or arm64) or macOS (Intel or Apple silicon), verifies it against the release `SHA256SUMS`, checks that it runs, and moves it into `~/.local/bin`. `llamascope update` does the same in place. Neither edits shell configuration; add `~/.local/bin` to your `PATH` yourself if necessary. While the repository is private, export `GH_TOKEN` or sign in with `gh` first, and fetch the script with `gh api -H "Accept: application/vnd.github.raw" repos/agustinsacco/llamascope/contents/install.sh | sh`.
+The installer downloads the release build for Linux (static, x86_64 or arm64) or macOS (Intel or Apple silicon), verifies it against the release `SHA256SUMS`, checks that it runs, and moves it into `~/.local/bin`. `llamascope update` does the same in place. Neither edits shell configuration; add `~/.local/bin` to your `PATH` yourself if necessary. Every green build of `main` is released automatically.
 
 ```bash
 # Choose another installation root, or pin a version.
-curl -fsSL .../install.sh | PREFIX="$HOME/tools" sh -s -- --version 1.1.0
+curl -fsSL https://github.com/agustinsacco/llamascope/releases/latest/download/install.sh | PREFIX="$HOME/tools" sh -s -- --version 1.1.42
 
 # Build this checkout with Cargo instead of downloading.
 ./install.sh --source
