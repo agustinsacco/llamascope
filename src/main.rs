@@ -3,13 +3,69 @@ use llamascope::{
     app::{Action, AppState},
     config::{Config, HELP},
     demo, hardware,
+    hardware::HardwareTelemetry,
     telemetry::{Poller, TelemetryData, Worker},
+    update,
 };
 use std::{
     io::{self, IsTerminal},
-    sync::mpsc::{Receiver, TryRecvError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, TryRecvError},
+        Arc,
+    },
     time::{Duration, Instant},
 };
+
+type Source<T> = (Worker, Receiver<T>);
+type Sensors = Source<(HardwareTelemetry, Instant)>;
+
+/// `llamascope update`. An optional token (GH_TOKEN, GITHUB_TOKEN, `gh auth token`) only raises the API rate limit.
+fn self_update(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = args.collect();
+    if args.iter().any(|s| matches!(s.as_str(), "--help" | "-h")) {
+        println!("{}", update::USAGE);
+        return Ok(());
+    }
+    let options = update::Options::parse(args)?;
+    let target = update::target()
+        .ok_or("No release builds exist for this platform; use install.sh --source.")?;
+    let env = |name| {
+        std::env::var(name)
+            .ok()
+            .filter(|v: &String| !v.trim().is_empty())
+    };
+    let token = env("GH_TOKEN").or_else(|| env("GITHUB_TOKEN")).or_else(|| {
+        let output = std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .ok()?;
+        let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        (output.status.success() && !token.is_empty()).then_some(token)
+    });
+    let source = update::Source {
+        api: update::API,
+        repository: update::REPOSITORY,
+        token,
+        target,
+        current: llamascope::VERSION,
+        executable: std::env::current_exe()?,
+    };
+    let current = source.current;
+    match update::run(&options, &source)? {
+        update::Outcome::UpToDate(latest) => {
+            println!("LlamaScope {current} is up to date (latest {latest}).")
+        }
+        update::Outcome::Available(latest) => {
+            println!("LlamaScope {latest} is available (running {current}). Run: llamascope update")
+        }
+        update::Outcome::Updated(latest) => println!(
+            "Updated {} from {current} to {latest}. Restart running dashboards to use it.",
+            source.executable.display()
+        ),
+    }
+    Ok(())
+}
 
 fn main() {
     if let Err(error) = start() {
@@ -20,6 +76,9 @@ fn main() {
 
 fn start() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("update") {
+        return self_update(args.into_iter().skip(1));
+    }
     if args.iter().any(|s| matches!(s.as_str(), "--help" | "-h")) {
         println!("{HELP}");
         return Ok(());
@@ -28,37 +87,50 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|s| matches!(s.as_str(), "--version" | "-V"))
     {
-        println!("LlamaScope {}", env!("CARGO_PKG_VERSION"));
+        println!("LlamaScope {}", llamascope::VERSION);
         return Ok(());
     }
     let config = Config::parse(args, |name| std::env::var(name).ok())?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("An interactive terminal is required. Try llamascope --demo in a terminal, or --help for options.".into());
     }
-    let server = if config.demo {
-        None
+    // SIGTERM, SIGHUP and friends end the loop like `q`, so the terminal is restored.
+    let terminate = Arc::new(AtomicBool::new(false));
+    for signal in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGQUIT,
+    ] {
+        signal_hook::flag::register(signal, Arc::clone(&terminate))?;
+    }
+    let mut state = AppState::from_config(&config);
+    let (server, sensors) = if config.demo {
+        let epoch = demo::seed(&mut state);
+        let server = Worker::spawn(demo::TICK, move || {
+            demo::telemetry(demo::tick_at(epoch, Instant::now()), epoch)
+        });
+        let sensors = Worker::spawn(demo::TICK, move || {
+            let tick = demo::tick_at(epoch, Instant::now());
+            (demo::hardware(tick), epoch + demo::TICK * tick as u32)
+        });
+        (server, Some(sensors))
     } else {
         let mut poller = Poller::new(config.clone()).map_err(|_| {
             "Could not initialize the HTTP client. Check TLS/network configuration."
         })?;
-        Some(Worker::spawn(config.interval, move || poller.sample()))
-    };
-    let sensors = if config.demo {
-        None
-    } else {
         let no_gpu = config.no_gpu;
-        Some(Worker::spawn(Duration::from_secs(2), move || {
-            hardware::sample(no_gpu)
-        }))
+        let sensors = Worker::spawn(Duration::from_secs(2), move || {
+            (hardware::sample(no_gpu), Instant::now())
+        });
+        (
+            Worker::spawn(config.interval, move || poller.sample()),
+            Some(sensors),
+        )
     };
     // dashboard owns terminal cleanup. Workers are joined only after the screen is restored.
-    let result = dashboard(&config, server.as_ref(), sensors.as_ref());
-    if let Some((worker, _)) = &server {
-        worker.stop();
-    }
-    if let Some((worker, _)) = &sensors {
-        worker.stop();
-    }
+    let result = dashboard(state, &server, sensors, &terminate);
+    server.0.stop();
     result?;
     Ok(())
 }
@@ -70,10 +142,22 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn receive<T>(source: Option<&(Worker, Receiver<T>)>, pending: &mut Option<T>) -> io::Result<()> {
-    if let Some((_, rx)) = source {
-        match rx.try_recv() {
-            Ok(data) => *pending = Some(data),
+fn dashboard(
+    mut state: AppState,
+    server: &Source<TelemetryData>,
+    mut sensors: Option<Sensors>,
+    terminate: &AtomicBool,
+) -> io::Result<()> {
+    // Create the guard before initialization so partially completed setup is also restored.
+    let _guard = TerminalGuard;
+    let mut terminal = ratatui::try_init()?;
+    state.log(
+        false,
+        "LlamaScope ready. ? opens the field guide; q / Ctrl-C exits safely.",
+    );
+    while !terminate.load(Ordering::Relaxed) {
+        match server.1.try_recv() {
+            Ok(data) => state.receive(data),
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 return Err(io::Error::other(
@@ -81,72 +165,27 @@ fn receive<T>(source: Option<&(Worker, Receiver<T>)>, pending: &mut Option<T>) -
                 ))
             }
         }
-    }
-    Ok(())
-}
-
-fn dashboard(
-    config: &Config,
-    server: Option<&(Worker, Receiver<TelemetryData>)>,
-    sensors: Option<&(Worker, Receiver<hardware::HardwareTelemetry>)>,
-) -> io::Result<()> {
-    // Create the guard before initialization so partially completed setup is also restored.
-    let _guard = TerminalGuard;
-    let mut terminal = ratatui::try_init()?;
-    let mut state = AppState::new();
-    state.theme = config.theme;
-    state.stale_after = (config.interval * 3).max(Duration::from_secs(3));
-    state.endpoint.clone_from(&config.api_url);
-    state.demo = config.demo;
-    state.log(
-        false,
-        "LlamaScope ready. ? opens the field guide; q / Ctrl-C exits safely.",
-    );
-    if config.demo {
-        state.started_at = Instant::now() - Duration::from_secs(60);
-        for tick in 0..120 {
-            let (data, hardware) = demo::sample(tick, state.started_at);
-            let at = data.sampled_at;
-            state.update(data);
-            state.update_hardware(hardware, at);
-        }
-    }
-    let mut pending_server = None;
-    let mut pending_hardware = None;
-    let mut last_demo_tick = 119;
-    loop {
-        receive(server, &mut pending_server)?;
-        receive(sensors, &mut pending_hardware)?;
-        if config.demo {
-            let tick = state.started_at.elapsed().as_millis() as u64 / 500;
-            if tick != last_demo_tick {
-                let (data, hardware) = demo::sample(tick, state.started_at);
-                pending_server = Some(data);
-                pending_hardware = Some(hardware);
-                last_demo_tick = tick;
-            }
-        }
-        if state.paused_at.is_none() {
-            if let Some(data) = pending_server.take() {
-                state.update(data);
-            }
-            if let Some(data) = pending_hardware.take() {
-                state.update_hardware(data, Instant::now());
+        // Local sensors are optional: losing them must never end server monitoring.
+        if let Some((_, rx)) = &sensors {
+            match rx.try_recv() {
+                Ok((hardware, at)) => state.receive_hardware(hardware, at),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    state.sensors_stopped("collector ended unexpectedly");
+                    sensors = None;
+                }
             }
         }
         terminal.draw(|frame| state.draw(frame))?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match state.handle_key(key) {
-                    Action::Quit => return Ok(()),
-                    Action::Retry => {
-                        if let Some((worker, _)) = server {
-                            worker.retry();
-                        }
-                    }
+                    Action::Quit => break,
+                    Action::Retry => server.0.retry(),
                     Action::None => {}
                 }
             }
         }
     }
+    Ok(())
 }

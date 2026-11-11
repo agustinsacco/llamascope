@@ -24,10 +24,15 @@ impl Memory {
 }
 #[derive(Clone, Debug, Default)]
 pub struct GpuTelemetry {
+    /// Which device and tool produced the reading, e.g. `AMD card0 · rocm-smi`.
+    pub source: &'static str,
     pub usage: Option<f64>,
     pub temp: Option<f64>,
     pub power: Option<f64>,
     pub vram: Option<Memory>,
+    /// AMD graphics translation table: system memory mapped for the GPU. On APUs
+    /// (e.g. Strix Halo) model weights live here, not in the small VRAM carve-out.
+    pub gtt: Option<Memory>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct HardwareTelemetry {
@@ -123,32 +128,94 @@ pub fn parse_vm_stat(total: &str, stats: &str) -> Option<Memory> {
     memory(total - available, total, 1024.0_f64.powi(3))
 }
 
-fn number(value: Option<&Value>) -> Option<f64> {
-    let n = match value? {
-        Value::String(s) => s.parse().ok()?,
-        Value::Number(n) => n.as_f64()?,
-        _ => return None,
-    };
+/// A finite, non-negative sensor value; anything else (`N/A`, NaN, negative) is unavailable.
+fn valid(n: f64) -> Option<f64> {
     (n.is_finite() && n >= 0.0).then_some(n)
 }
+fn reported(text: &str) -> Option<f64> {
+    text.trim().parse().ok().and_then(valid)
+}
+fn number(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::String(s) => reported(s),
+        Value::Number(n) => n.as_f64().and_then(valid),
+        _ => None,
+    }
+}
+fn reading(gpu: GpuTelemetry) -> Option<GpuTelemetry> {
+    let any = gpu.usage.is_some()
+        || gpu.temp.is_some()
+        || gpu.power.is_some()
+        || gpu.vram.is_some()
+        || gpu.gtt.is_some();
+    any.then_some(gpu)
+}
+
+/// `rocm-smi --showuse --showtemp --showpower --showmeminfo vram gtt --json`, first card.
+/// The targeted query matters: `-a` omits memory keys on some APUs.
 pub fn parse_rocm(text: &str) -> Option<GpuTelemetry> {
     let value: Value = serde_json::from_str(text).ok()?;
     let card = value.get("card0")?.as_object()?;
-    let usage = number(card.get("GPU use (%)")).map(|n| n.min(100.0));
-    let temp = number(card.get("Temperature (Sensor edge) (C)"));
-    let power = number(card.get("Current Socket Graphics Package Power (W)"))
-        .or_else(|| number(card.get("Average Graphics Package Power (W)")));
-    let vram = number(card.get("VRAM Total Used Memory (B)"))
-        .zip(number(card.get("VRAM Total Memory (B)")))
-        .and_then(|(used, total)| memory(used, total, 1024.0_f64.powi(3)));
-    (usage.is_some() || temp.is_some() || power.is_some() || vram.is_some()).then_some(
-        GpuTelemetry {
-            usage,
-            temp,
-            power,
-            vram,
-        },
-    )
+    let bytes = |used: &str, total: &str| {
+        number(card.get(used))
+            .zip(number(card.get(total)))
+            .and_then(|(used, total)| memory(used, total, 1024.0_f64.powi(3)))
+    };
+    reading(GpuTelemetry {
+        source: "AMD card0 · rocm-smi",
+        usage: number(card.get("GPU use (%)")).map(|n| n.min(100.0)),
+        temp: number(card.get("Temperature (Sensor edge) (C)")),
+        power: number(card.get("Current Socket Graphics Package Power (W)"))
+            .or_else(|| number(card.get("Average Graphics Package Power (W)"))),
+        vram: bytes("VRAM Total Used Memory (B)", "VRAM Total Memory (B)"),
+        gtt: bytes("GTT Total Used Memory (B)", "GTT Total Memory (B)"),
+    })
+}
+
+/// `nvidia-smi --query-gpu=... --format=csv,noheader,nounits`, first GPU: utilization %, °C, W, used MiB, total MiB.
+/// Unsupported fields are reported as `[N/A]` and stay unavailable.
+pub fn parse_nvidia_smi(text: &str) -> Option<GpuTelemetry> {
+    let fields: Vec<_> = text.lines().next()?.split(',').map(reported).collect();
+    let [usage, temp, power, used, total] = fields[..] else {
+        return None;
+    };
+    reading(GpuTelemetry {
+        source: "NVIDIA GPU 0 · nvidia-smi",
+        usage: usage.map(|n| n.min(100.0)),
+        temp,
+        power,
+        vram: used
+            .zip(total)
+            .and_then(|(used, total)| memory(used, total, 1024.0)),
+        gtt: None,
+    })
+}
+
+const ROCM_ARGS: &[&str] = &[
+    "--showuse",
+    "--showtemp",
+    "--showpower",
+    "--showmeminfo",
+    "vram",
+    "gtt",
+    "--json",
+];
+const NVIDIA_ARGS: &[&str] = &[
+    "--query-gpu=utilization.gpu,temperature.gpu,power.draw,memory.used,memory.total",
+    "--format=csv,noheader,nounits",
+];
+
+type Parser = fn(&str) -> Option<GpuTelemetry>;
+/// GPU probes in priority order. Add a vendor by adding a tool, its arguments, and a parser.
+const GPU_PROBES: &[(&str, &[&str], Parser)] = &[
+    ("rocm-smi", ROCM_ARGS, parse_rocm),
+    ("nvidia-smi", NVIDIA_ARGS, parse_nvidia_smi),
+];
+
+fn probe_gpu() -> Option<GpuTelemetry> {
+    GPU_PROBES.iter().find_map(|(program, args, parse)| {
+        command_output(program, args, Duration::from_millis(800)).and_then(|s| parse(&s))
+    })
 }
 
 pub fn sample(no_gpu: bool) -> HardwareTelemetry {
@@ -166,18 +233,13 @@ pub fn sample(no_gpu: bool) -> HardwareTelemetry {
     } else {
         None
     };
-    let gpu = if no_gpu {
-        None
-    } else {
-        command_output("rocm-smi", &["-a", "--json"], Duration::from_millis(800))
-            .and_then(|s| parse_rocm(&s))
-    };
+    let gpu = if no_gpu { None } else { probe_gpu() };
     let note = if no_gpu {
         "GPU probes disabled by --no-gpu."
     } else if gpu.is_none() {
-        "AMD GPU unavailable. rocm-smi is optional; inference monitoring still works."
+        "No GPU reading from rocm-smi or nvidia-smi. Both are optional; inference monitoring still works."
     } else {
-        "Local AMD card0 / rocm-smi"
+        "Local GPU sensors"
     }
     .into();
     HardwareTelemetry { memory, gpu, note }

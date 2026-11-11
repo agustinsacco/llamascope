@@ -20,7 +20,7 @@ flowchart TB
     end
     subgraph Local[Independent local sensor worker]
         RAM[Linux procfs / macOS tools]
-        AMD[Optional rocm-smi]
+        AMD[Optional rocm-smi / nvidia-smi]
         Sensors[Validate optional readings]
     end
     Health & Slots & Props --> Client --> Decode --> Rate
@@ -68,7 +68,7 @@ HTTP redirects are refused and TLS validation stays enabled. The bearer header i
 
 ### Sensor lane
 
-`hardware::sample` reads Linux memory without a subprocess, or uses macOS `sysctl` / `vm_stat`. Optional AMD sampling executes `rocm-smi -a --json` directly—not through a shell. GPU failure cannot block the network worker or remove valid host RAM.
+`hardware::sample` reads Linux memory without a subprocess, or uses macOS `sysctl` / `vm_stat`. Optional GPU sampling runs a fixed list of probes (`rocm-smi`, then `nvidia-smi`) directly, not through a shell, and keeps the first that returns a reading. Adding a vendor means adding a tool, its arguments, and a parser to `GPU_PROBES`. GPU failure cannot block the network worker or remove valid host RAM. If the sensor worker ends unexpectedly, the dashboard reports it and keeps monitoring the server.
 
 Subprocess stdout is drained concurrently to avoid a full-pipe deadlock. Runtime and output are bounded. Timeout/error paths kill and reap the direct child. Tools that spawn descendants retaining stdout are outside the supported sensor contract; a timed-out stdout reader can outlive that individual sample until its pipe closes. Only trusted, locally installed sensor tools should be placed on `PATH`.
 
@@ -92,7 +92,7 @@ Selection follows **slot identity**, not response position. Rows are sorted by I
 
 A slot baseline stores `(task identity, decoded count, monotonic time)`. A rate is computed only when a busy slot has a known matching task, a nondecreasing count, and positive elapsed time. Otherwise it is unavailable. An unchanged count is a valid zero; a missing count is not.
 
-Prompt/context metrics are optional because upstream payloads vary. `next_token` accepts the documented object and the legacy array shape the original LlamaScope adapter expected. Signed remaining counts allow unlimited generation. Malformed required fields, duplicate IDs, and incompatible envelopes are errors.
+Prompt/context metrics are optional because upstream payloads vary. `next_token` accepts the array shape current llama-server emits and the object shape shown in some upstream examples. `n_prompt_tokens` is the slot's current token count, not the prompt length, so no prefill percentage is derived from it. Signed remaining counts allow unlimited generation. Malformed required fields, duplicate IDs, and incompatible envelopes are errors.
 
 See the upstream [server endpoint reference](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#api-endpoints) and the checked-in [fixture notes](../tests/fixtures/README.md). These are compatibility examples, not a guarantee that every future llama.cpp schema is supported.
 
@@ -108,7 +108,7 @@ See the upstream [server endpoint reference](https://github.com/ggml-org/llama.c
 | Metadata | Refresh after 30 seconds; retry after failure. |
 | Local sensor interval | 2 seconds, independent of HTTP. |
 | macOS subprocess | 500 ms per command. |
-| AMD subprocess | 800 ms. |
+| GPU subprocess | 800 ms per probe. |
 | Subprocess output | 64 KiB; malformed/oversized output is unavailable. |
 | Worker mailboxes | One item each; if full, a new sample is dropped rather than queued unboundedly. |
 | Frozen pending data | One latest drained snapshot per source. |
@@ -128,7 +128,7 @@ History x-values are monotonic elapsed seconds, not sample indices. Chart window
 5. Restore the screen before stopping/joining collectors. Both workers receive a stop request before either is joined, preventing a queued retry from starting another cycle on shutdown.
 6. An already running HTTP cycle can finish within its request deadlines (up to roughly six seconds for three requests). The terminal has already been restored while this shutdown completes.
 
-Normal `q` and Ctrl-C exits are exercised in a real pseudo-terminal. Panic restoration relies on Ratatui’s installed hook; `SIGKILL`, emulator crashes, and externally imposed process termination cannot be made cleanup-safe.
+Normal `q` and Ctrl-C exits are exercised in a real pseudo-terminal. `SIGTERM`, `SIGHUP`, `SIGINT`, and `SIGQUIT` set a flag that ends the loop like `q`, so the terminal is restored. Panic restoration relies on Ratatui’s installed hook; `SIGKILL` and emulator crashes cannot be made cleanup-safe.
 
 ## Code map
 
@@ -137,16 +137,18 @@ Normal `q` and Ctrl-C exits are exercised in a real pseudo-terminal. Panic resto
 | `src/config.rs` | Configuration precedence, validation, noninteractive help. |
 | `src/telemetry.rs` | Endpoint handling, protocol decoding, rate tracking, worker lifecycle. |
 | `src/hardware.rs` | Optional local sensor collection and numeric validation. |
-| `src/app.rs` | View state, bounded history/events, key actions, responsive presentation. |
+| `src/app.rs` | View state, bounded history/events, freeze/resume, key actions. |
+| `src/ui/` | Responsive presentation: header and summary (`mod.rs`), slots and events, local sensors, help. |
 | `src/theme.rs` | Semantic Mocha and Latte palette tokens. |
-| `src/demo.rs` | Deterministic simulation; no I/O. |
-| `src/main.rs` | Terminal ownership, snapshot delivery, freeze/resume, event loop. |
+| `src/demo.rs` | Deterministic simulation and history seeding; no I/O. |
+| `src/main.rs` | Terminal ownership, worker wiring, signals, event loop. |
+| `src/update.rs` | `llamascope update`: fetch a GitHub release build, verify `SHA256SUMS`, test-run, atomic rename. |
 | `examples/snapshot.rs` | Export the actual Ratatui test buffer to SVG. |
 | `tests/` | Config, protocol, state, rendering, contrast, PTY, and script regression checks. |
 
 ## Privacy and trust boundaries
 
-LlamaScope performs only GET requests to the configured server and local sensor reads. It does not implement analytics, persistent history, inference submission, or server mutations. Network requests may follow the system’s proxy configuration; use trusted proxy settings and HTTPS where appropriate.
+LlamaScope performs only GET requests to the configured server and local sensor reads. The only other network access is `llamascope update`, which you run explicitly and which talks only to the GitHub API. It does not implement analytics, persistent history, inference submission, or server mutations. Network requests may follow the system’s proxy configuration; use trusted proxy settings and HTTPS where appropriate.
 
 Server bodies may contain sensitive fields even when LlamaScope does not display them. Responses are transiently read to decode telemetry; unknown fields are ignored, and raw response bodies are not logged. Model basenames, task IDs, server addresses, and operational measurements may appear on screen. Treat screenshots as potentially sensitive.
 

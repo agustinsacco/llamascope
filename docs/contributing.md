@@ -27,7 +27,7 @@ cargo test --locked --all-targets
 cargo build --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 python3 tests/terminal_smoke.py
-bash -n start.sh install.sh
+bash -n start.sh && sh -n install.sh
 python3 tests/scripts_smoke.py
 ```
 
@@ -114,3 +114,13 @@ Prefer one concern per PR: a protocol fix, a sensor adapter, an interaction impr
 - [ ] Render, protocol, CLI, and surrounding quality gates pass.
 - [ ] Documentation commands were actually exercised where the environment permits.
 - [ ] Real-server and real-hardware limitations are explicitly stated.
+
+## Releasing
+
+There is no manual release step. After every green [Quality](../.github/workflows/ci.yml) run on `main`, the [Release workflow](../.github/workflows/release.yml) builds static Linux (musl, x86_64 and arm64) and macOS binaries from that exact commit and publishes them as the latest GitHub release, with `SHA256SUMS` and `install.sh`. This mirrors Phosphor's continuous release.
+
+- **Version:** `<major>.<minor>` from `Cargo.toml`, patch = number of commits on `main` (for example `1.1.57`). It always increases and needs no bump commit. Edit `Cargo.toml` only to change major or minor. Local builds report `Cargo.toml`'s `X.Y.0`, so `llamascope update` always offers the newest release.
+- **Skip a release:** end the merge commit message with the trailer `Skip-Release: true`.
+- **Retry:** run the Release workflow by hand on `main`. It republishes only if that commit's Quality run passed and its tag does not exist yet.
+
+`install.sh` and `llamascope update` both read `llamascope-<target>` and `SHA256SUMS` from the release, so keep those asset names stable.

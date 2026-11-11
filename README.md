@@ -55,31 +55,37 @@ Current llama.cpp builds expose `/slots` by default. Do not start the server wit
 | What you want to know | Where to look |
 | :--- | :--- |
 | **Is the server ready?** | Connecting, model-loading, live, degraded, offline, and stale states—with recovery guidance and sample age. |
-| **Where is the work?** | Stable, keyboard-selectable slots with phase, throughput, prefill, estimated context, and—when there is room—generated tokens and task identity. |
+| **Where is the work?** | Stable, keyboard-selectable slots with phase, throughput, prompt tokens ingested, context use, and—when there is room—generated tokens and task identity. |
 | **What changed?** | Independent throughput/context chart scales, a 60-second window, and a bounded event stream that shows the newest events. |
-| **Is this machine under pressure?** | Local RAM history; optional AMD compute, VRAM, temperature, and power readings. Local sensors are explicitly **not** remote-server metrics. |
+| **Is this machine under pressure?** | Local RAM history; optional AMD or NVIDIA compute, VRAM (and AMD GTT), temperature, and power readings. Local sensors are explicitly **not** remote-server metrics. |
 
 ### Quiet by design, honest by default
 
 - **Mocha after dark. Latte in daylight.** One semantic palette per theme, visible selected rows, and text labels that never depend on color alone.
 - **A useful first frame.** Connection guidance and sensor discovery replace blank panels. Empty, unavailable, and disconnected are different states.
 - **Failure is information.** HTTP errors and invalid JSON are explained—not silently converted into healthy empty responses. Last-known slot readings remain labeled during interruptions.
-- **Unknown means `--`, not zero.** Missing prompt counters, queue depth, temperatures, and first-sample rates stay visibly unavailable.
-- **A terminal, not a trap.** Fallible setup, a cleanup guard, a panic-restoration hook, and explicit Ctrl-C handling protect normal use. No software can restore a terminal after `SIGKILL` or a terminal emulator crash.
+- **Unknown means `--`, not zero.** Missing prompt counters, temperatures, and first-sample rates stay visibly unavailable.
+- **A terminal, not a trap.** Fallible setup, a cleanup guard, a panic-restoration hook, and explicit Ctrl-C handling protect normal use. `SIGTERM` and `SIGHUP` also restore the terminal. No software can restore it after `SIGKILL` or a terminal emulator crash.
 - **No runtime service to operate.** A Rust binary built on [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm). No browser frontend, database, or JavaScript runtime.
 
 ## Install once, observe often
 
 ```bash
-./install.sh
+curl -fsSL https://github.com/agustinsacco/llamascope/releases/latest/download/install.sh | sh
 ~/.local/bin/llamascope --demo
+
+# Later: replace the binary with the newest release.
+llamascope update            # or: llamascope update --check / --version X.Y.Z
 ```
 
-The installer builds with the committed lockfile and installs into `~/.local/bin`. It explicitly replaces an existing LlamaScope binary; it **does not download Rust or edit shell configuration**. Add that directory to your `PATH` yourself if necessary.
+The installer downloads the release build for Linux (static, x86_64 or arm64) or macOS (Intel or Apple silicon), verifies it against the release `SHA256SUMS`, checks that it runs, and moves it into `~/.local/bin`. `llamascope update` does the same in place. Neither edits shell configuration; add `~/.local/bin` to your `PATH` yourself if necessary. Every green build of `main` is released automatically.
 
 ```bash
-# Choose another installation root.
-PREFIX="$HOME/tools" ./install.sh
+# Choose another installation root, or pin a version.
+curl -fsSL https://github.com/agustinsacco/llamascope/releases/latest/download/install.sh | PREFIX="$HOME/tools" sh -s -- --version 1.1.42
+
+# Build this checkout with Cargo instead of downloading.
+./install.sh --source
 
 # Or stay inside the checkout; Cargo rebuilds only when necessary.
 ./start.sh --demo --theme latte
@@ -134,7 +140,7 @@ A **140 × 42** terminal is comfortable. At **80 × 24**, the inference view tak
 
 ## Read the numbers responsibly
 
-**This is an instrument panel, not a benchmark.** Token rates are sampled deltas for the same task, not end-to-end request throughput. Context is a token-count estimate, not physical KV-memory allocation. A fast request can finish between polls. Different llama.cpp versions expose different counters; many stock builds omit prompt-progress and queue fields.
+**This is an instrument panel, not a benchmark.** Token rates are sampled deltas for the same task, not end-to-end request throughput. Context is a token-count estimate, not physical KV-memory allocation. A fast request can finish between polls. Different llama.cpp versions expose different counters, and `/slots` does not report total prompt length, so there is no prefill percentage.
 
 Hardware support is intentionally explicit:
 
@@ -142,8 +148,9 @@ Hardware support is intentionally explicit:
 | --- | --- | --- | --- |
 | Server telemetry and demo | Yes | Yes | Not validated in CI |
 | Local RAM | `/proc/meminfo` | `sysctl` + `vm_stat` estimate | Unavailable |
-| Local AMD GPU | Optional `rocm-smi`, `card0` | Normally unavailable | Not validated |
-| NVIDIA / Apple GPU / remote GPU sensors | Not implemented | Not implemented | Not implemented |
+| Local AMD GPU | Optional `rocm-smi`, `card0`, VRAM + GTT | Normally unavailable | Not validated |
+| Local NVIDIA GPU | Optional `nvidia-smi`, GPU 0 | Not applicable | Not validated |
+| Apple GPU / remote GPU sensors | Not implemented | Not implemented | Not implemented |
 
 Missing sensors never prevent inference monitoring. [Metric definitions and caveats →](docs/guide.md#the-metric-dictionary)
 

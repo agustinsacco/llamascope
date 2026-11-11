@@ -43,5 +43,19 @@ jobs:
         run: python3 tests/terminal_smoke.py
       - name: Launcher and installer contracts
         run: |
-          bash -n start.sh install.sh
+          bash -n start.sh && sh -n install.sh
           python3 tests/scripts_smoke.py
+
+  msrv:
+    name: Minimum supported Rust (Cargo.toml rust-version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check with the declared rust-version
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+          cargo +"$msrv" check --locked --all-targets

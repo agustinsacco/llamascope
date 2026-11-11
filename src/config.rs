@@ -6,6 +6,7 @@ pub const HELP: &str = "LlamaScope — a calm observatory for local inference
 
 USAGE
   llamascope [OPTIONS]
+  llamascope update [--check] [--version X.Y.Z]   Install the latest release build
 
 OPTIONS
   --url URL        llama-server base URL (default http://127.0.0.1:8086)
@@ -56,12 +57,14 @@ impl Config {
         args: impl IntoIterator<Item = String>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
+        // An exported-but-empty variable means "unset" for every setting, consistently.
+        let var = |name: &str| env(name).filter(|value| !value.trim().is_empty());
         let mut config = Self::default();
-        if let Some(url) = env("LLAMA_API_URL") {
+        if let Some(url) = var("LLAMA_API_URL") {
             config.api_url = url;
         }
-        config.api_key = env("LLAMA_API_KEY").filter(|s| !s.is_empty());
-        let mut theme = env("LLAMASCOPE_THEME").unwrap_or_else(|| "mocha".into());
+        config.api_key = var("LLAMA_API_KEY");
+        let mut theme = var("LLAMASCOPE_THEME").unwrap_or_else(|| "mocha".into());
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
